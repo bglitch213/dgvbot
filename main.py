@@ -114,7 +114,7 @@ async def log_admin_action(guild: discord.Guild, action_text: str):
         if channel:
             now = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
             embed = discord.Embed(
-                title="🛡 관리자 명령어 실행 기록",
+                title="🛡️ 관리자 명령어 실행 기록",
                 description=f"**내용:** {action_text}\n**시간:** {now}",
                 color=discord.Color.orange()
             )
@@ -291,7 +291,7 @@ async def my_info(
         f"- 🪙 대깨 코인: **{coins}개**\n"
         f"- ⌛ 음성 접속 시간: **{minutes}분**\n"
         f"- ⚠️ 경고 횟수: **{warnings}회** (3회 누적 시 차단)\n"
-        f"- 🛡 방어권: **{defense_tickets}개**",
+        f"- 🛡️ 경고 방어권: **{defense_tickets}개**",
         ephemeral=True,
     )
 

@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import time
+import asyncio
 from threading import Thread
 from datetime import datetime, timezone, timedelta
 import discord
@@ -290,7 +291,7 @@ async def my_info(
         f"- 🪙 대깨 코인: **{coins}개**\n"
         f"- ⌛ 음성 접속 시간: **{minutes}분**\n"
         f"- ⚠️ 경고 횟수: **{warnings}회** (3회 누적 시 차단)\n"
-        f"- 🛡️️ 경고 방어권: **{defense_tickets}개**",
+        f"- 🛡 방어권: **{defense_tickets}개**",
         ephemeral=True,
     )
 
@@ -372,6 +373,83 @@ async def register_referral(interaction: discord.Interaction, referrer: discord.
         f"✅ 성공적으로 {referrer.mention}님을 추천인으로 등록했습니다! 추천인에게 **{referral_reward}코인**이 지급되었습니다.",
         ephemeral=True,
     )
+
+
+@bot.tree.command(
+    name="채팅청소",
+    description="지정한 유저의 채팅을 입력한 수량만큼 삭제합니다. (일반 유저는 본인만 가능, 관리자는 타인 가능)",
+)
+@app_commands.describe(
+    member="청소할 대상 유저 (생략 시 본인)",
+    count="삭제할 메시지 최대 수량 (1~100)"
+)
+async def clear_chat(
+    interaction: discord.Interaction, member: discord.Member = None, count: int = 10
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if count < 1 or count > 100:
+        await interaction.followup.send("❌ 삭제할 수량은 **1개 이상 100개 이하**로 입력해주세요.", ephemeral=True)
+        return
+
+    target = member or interaction.user
+    is_admin = interaction.user.guild_permissions.administrator
+
+    if not is_admin and target.id != interaction.user.id:
+        await interaction.followup.send("❌ 일반 사용자는 **본인의 채팅만** 청소할 수 있습니다.", ephemeral=True)
+        return
+
+    channel = interaction.channel
+    deleted_count = 0
+    now = datetime.now(timezone.utc)
+
+    try:
+        messages_to_delete = []
+        async for message in channel.history(limit=200):
+            if message.author.id == target.id:
+                messages_to_delete.append(message)
+                if len(messages_to_delete) >= count:
+                    break
+
+        if not messages_to_delete:
+            await interaction.followup.send(f"🧹 삭제할 수 있는 {target.mention}님의 최근 메시지가 없습니다.", ephemeral=True)
+            return
+
+        two_weeks_ago = now - timedelta(days=14)
+        bulk_list = []
+        old_list = []
+
+        for msg in messages_to_delete:
+            if msg.created_at > two_weeks_ago:
+                bulk_list.append(msg)
+            else:
+                old_list.append(msg)
+
+        if bulk_list:
+            if len(bulk_list) == 1:
+                await bulk_list[0].delete()
+            else:
+                await channel.delete_messages(bulk_list)
+            deleted_count += len(bulk_list)
+
+        for msg in old_list:
+            try:
+                await msg.delete()
+                deleted_count += 1
+                await asyncio.sleep(0.5)
+            except Exception:
+                pass
+
+        await interaction.followup.send(
+            f"🧹 **{target.name}**님의 메시지 **{deleted_count}개**를 성공적으로 청소했습니다!",
+            ephemeral=True
+        )
+
+        if is_admin and target.id != interaction.user.id:
+            await log_admin_action(interaction.guild, f"{interaction.user}님이 {target}님의 메시지 {deleted_count}개를 채널({channel.name})에서 청소함")
+
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ 메시지 청소 중 오류가 발생했습니다: {e}", ephemeral=True)
 
 
 # ----------------------------------------------------
@@ -461,7 +539,6 @@ async def give_warning(
     conn = get_db()
     cursor = conn.cursor()
     
-    # 먼저 유저 레코드가 없으면 생성
     cursor.execute(
         """
         INSERT INTO users (guild_id, user_id, coins, voice_minutes, warnings, defense_tickets)
@@ -471,7 +548,6 @@ async def give_warning(
         (guild_id, target_id),
     )
 
-    # 현재 경고 및 방어권 조회
     cursor.execute(
         "SELECT warnings, defense_tickets FROM users WHERE guild_id = ? AND user_id = ?",
         (guild_id, target_id),
@@ -481,7 +557,6 @@ async def give_warning(
     current_defense = row[1]
 
     if count > 0:
-        # 경고 부여 로직
         new_warnings = current_warnings + count
         new_defense = current_defense
         cursor.execute(
@@ -495,20 +570,17 @@ async def give_warning(
         action_desc = f"경고 **{count}회**가 부여되었습니다."
         log_text = f"{interaction.user}님이 {member}님에게 경고 {count}회를 부여함"
     else:
-        # 경고 차감 및 방어권 전환 로직 (음수이므로 절대값 활용)
         deduct_amount = abs(count)
         if current_warnings >= deduct_amount:
-            # 현재 경고 내에서 전액 차감 가능한 경우
             new_warnings = current_warnings - deduct_amount
             new_defense = current_defense
             action_desc = f"경고 **{deduct_amount}회**가 차감되었습니다."
             log_text = f"{interaction.user}님이 {member}님의 경고 {deduct_amount}회를 차감함"
         else:
-            # 경고가 부족하여 초과 차감분이 방어권으로 전환되는 경우
             leftover = deduct_amount - current_warnings
             new_warnings = 0
             new_defense = current_defense + leftover
-            action_desc = f"경고가 모두 소진되어, 초과된 **{leftover}회**만큼 **방어권 {leftover개}**로 적립되었습니다."
+            action_desc = f"경고가 모두 소진되어, 초과된 **{leftover}회**만큼 **방어권 {leftover}개**로 적립되었습니다."
             log_text = f"{interaction.user}님이 {member}님의 경고를 차감하고 초과분 {leftover}회를 방어권으로 전환함"
 
         cursor.execute(
@@ -532,7 +604,6 @@ async def give_warning(
 
     await log_admin_action(interaction.guild, f"{log_text} (현재 누적 경고: {total_warnings}회, 방어권: {total_defense}개)")
 
-    # 경고 3회 이상 누적 시 자동 차단 처리 (양수로 경고가 올라가서 3 이상이 된 경우)
     if count > 0 and total_warnings >= 3:
         try:
             await interaction.guild.ban(member, reason=f"경고 3회 누적 자동 차단 (관리자: {interaction.user})")
@@ -601,8 +672,6 @@ async def set_referral_reward(interaction: discord.Interaction, amount: int):
         return
 
     conn = get_db()
-    cursor = conn.권
-    # (오타 방지용 기존 연결 수정)
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -842,35 +911,38 @@ async def coin_ranking(interaction: discord.Interaction):
 async def show_commands(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🤖 봇 명령어 안내",
-        description="이 서버에서 사용할 수 있는 명령어입니다.",
+        description="이 서버에서 사용할 수 있는 명령어입니다. 사용자 권한별로 분류되어 있습니다.",
         color=discord.Color.blue(),
     )
+    
+    # 👤 일반 사용자용 명령어
     embed.add_field(
-        name="일반 명령어",
+        name="👤 일반 사용자용 명령어",
         value=(
-            "`/정보` — 내 코인 잔액, 음성 접속 시간, 경고 횟수, 방어권을 확인합니다.\n"
-            "`/추천인 [유저]` — 추천인을 등록합니다. 음성 접속 시간이 30분 이상이어야 합니다.\n"
-            "`/코인순위` — 이 서버의 코인 보유량 상위 10명을 확인합니다."
+            "• `/정보 [유저]` — 본인 또는 다른 유저의 코인 잔액, 음성 접속 시간, 경고 횟수, 방어권을 확인합니다.\n"
+            "• `/추천인 [유저]` — 나를 초대해준 사람을 추천인으로 등록합니다. (음성 접속 30분 이상 시 가능)\n"
+            "• `/채팅청소 [유저] [수량]` — 최근 채팅을 수량만큼 삭제합니다. **(일반 유저는 본인 채팅만 삭제 가능)**\n"
+            "• `/코인순위` — 이 서버의 코인 보유량 상위 10명을 확인합니다.\n"
+            "• `/명령어` — 봇의 전체 명령어 안내를 확인합니다."
         ),
         inline=False,
     )
+    
+    # 🛡️ 관리자 전용 명령어
     embed.add_field(
-        name="관리자 명령어",
+        name="🛡️ 관리자 전용 명령어",
         value=(
-            "`/코인지급 [유저] [수량]` — 코인을 조정합니다. (음수 입력은 차감)\n"
-            "`/경고지급 [유저] [횟수]` — 경고를 부여하거나 차감합니다. (음수 입력 시 차감 및 방어권 전환, 3회 누적 시 자동 차단)\n"
-            "`/보상설정 [수량]` — 음성 접속 누적 30분마다 지급할 코인을 설정합니다.\n"
-            "`/추천보상설정 [수량]` — 추천인 등록 성공 시 지급할 코인을 설정합니다.\n"
-            "`/코인초기화` — 서버 내 모든 유저의 코인을 공개 경고창을 통해 0으로 초기화합니다.\n"
-            "`/로그` — 관리자 명령어 실행 기록을 남길 채널을 설정합니다."
+            "• `/채팅청소 [타유저] [수량]` — **관리자 권한**으로 다른 유저의 채팅을 지정한 수량만큼 강제로 청소할 수 있습니다.\n"
+            "• `/코인지급 [유저] [수량]` — 특정 유저의 코인을 지급하거나 차감합니다. (차감은 마이너스 입력)\n"
+            "• `/경고지급 [유저] [횟수]` — 경고를 부여하거나 차감합니다. (음수 입력 시 차감 및 방어권 전환, 3회 누적 시 자동 밴)\n"
+            "• `/보상설정 [수량]` — 음성 채널 누적 30분 이용 시 지급될 코인 양을 설정합니다.\n"
+            "• `/추천보상설정 [수량]` — 추천인 등록 성공 시 추천인에게 지급할 코인 수를 설정합니다.\n"
+            "• `/코인초기화` — 서버 내 모든 유저의 코인을 공개 경고창을 통해 0으로 초기화합니다.\n"
+            "• `/로그` — 관리자 명령어 실행 기록이 남을 채널을 현재 채널로 설정합니다."
         ),
         inline=False,
     )
-    embed.add_field(
-        name="도움말",
-        value="`/명령어` — 이 명령어 안내를 다시 표시합니다.",
-        inline=False,
-    )
+
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 

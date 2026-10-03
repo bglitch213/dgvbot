@@ -291,7 +291,7 @@ async def my_info(
         f"- 🪙 대깨 코인: **{coins}개**\n"
         f"- ⌛ 음성 접속 시간: **{minutes}분**\n"
         f"- ⚠️ 경고 횟수: **{warnings}회** (3회 누적 시 차단)\n"
-        f"- 🛡 방어권: **{defense_tickets}개**",
+        f"- 🛡️ 방어권: **{defense_tickets}개**",
         ephemeral=True,
     )
 
@@ -616,18 +616,18 @@ async def give_warning(
             
             await interaction.followup.send(
                 f"🚨 **[경고 누적 차단]** {member.mention}님이 경고 3회를 초과(`누적 {total_warnings}회`)하여 **서버에서 자동으로 차단(밴)** 되었습니다!\n"
-                f"📊 대상자 현재 상태 — 경고: **{total_warnings}회**, 방어권: **{total_defense}개**"
+                f"⚠️ 대상자 현재 상태 — 경고: **{total_warnings}회**, 방어권: **{total_defense}개**"
             )
         except Exception as e:
             await interaction.followup.send(
                 f"⚠️ 경고가 {total_warnings}회 부여되었으나, 봇의 권한 부족으로 차단에 실패했습니다. (권한을 확인해주세요)\n오류: {e}\n"
-                f"📊 대상자 현재 상태 — 경고: **{total_warnings}회**, 방어권: **{total_defense}개**"
+                f"⚠️ 대상자 현재 상태 — 경고: **{total_warnings}회**, 방어권: **{total_defense}개**"
             )
     else:
         # ⚠️ 경고 지급 후 그 사람의 경고 횟수를 전부 표시
         await interaction.followup.send(
             f"⚠️ {member.mention}님에게 {action_desc}\n"
-            f"📊 대상자 현재 상태 — 경고: **{total_warnings}회**, 방어권: **{total_defense}개**",
+            f"⚠️ 대상자 현재 상태 — 경고: **{total_warnings}회**, 방어권: **{total_defense}개**",
             allowed_mentions=discord.AllowedMentions.none()
         )
 

@@ -40,6 +40,7 @@ def init_db():
             coins INTEGER DEFAULT 0,
             voice_minutes INTEGER DEFAULT 0,
             referred_by INTEGER DEFAULT NULL,
+            warnings INTEGER DEFAULT 0,
             PRIMARY KEY (guild_id, user_id)
         )
     """)
@@ -59,6 +60,13 @@ def init_db():
             log_channel_id INTEGER DEFAULT NULL
         )
     """)
+    
+    # 기존 데이터베이스 호환을 위한 컬럼 자동 추가 체크
+    cursor.execute("PRAGMA table_info(users)")
+    users_columns = {row[1] for row in cursor.fetchall()}
+    if "warnings" not in users_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN warnings INTEGER DEFAULT 0")
+
     cursor.execute("PRAGMA table_info(guild_settings)")
     settings_columns = {row[1] for row in cursor.fetchall()}
     if "referral_reward" not in settings_columns:
@@ -177,8 +185,8 @@ async def check_voice_time():
 
             cursor.execute(
                 """
-                INSERT OR IGNORE INTO users (guild_id, user_id, coins, voice_minutes)
-                VALUES (?, ?, 0, 0)
+                INSERT OR IGNORE INTO users (guild_id, user_id, coins, voice_minutes, warnings)
+                VALUES (?, ?, 0, 0, 0)
                 """,
                 (guild_id, user_id),
             )
@@ -250,7 +258,7 @@ async def on_voice_state_update(member, before, after):
 
 # 3. 슬래시 명령어 그룹 (일반 명령어)
 @bot.tree.command(
-    name="정보", description="본인 또는 선택한 사용자의 코인과 음성 접속 시간을 확인합니다."
+    name="정보", description="본인 또는 선택한 사용자의 코인, 음성 접속 시간, 경고 횟수를 확인합니다."
 )
 @app_commands.describe(member="조회할 사용자 (선택하지 않으면 본인)")
 async def my_info(
@@ -263,7 +271,7 @@ async def my_info(
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT coins, voice_minutes FROM users WHERE guild_id = ? AND user_id = ?",
+        "SELECT coins, voice_minutes, warnings FROM users WHERE guild_id = ? AND user_id = ?",
         (guild_id, user_id),
     )
     row = cursor.fetchone()
@@ -271,9 +279,13 @@ async def my_info(
 
     coins = row[0] if row else 0
     minutes = row[1] if row else 0
+    warnings = row[2] if row else 0
 
     await interaction.response.send_message(
-        f"📊 **{target.name}**님의 서버 활동 정보:\n- 코인: **{coins}개**\n- 음성 접속 시간: **{minutes}분**",
+        f"📊 **{target.name}**님의 서버 활동 정보:\n"
+        f"- 코인: **{coins}개**\n"
+        f"- 음성 접속 시간: **{minutes}분**\n"
+        f"- 경고 횟수: **{warnings}회** (3회 누적 시 차단)",
         ephemeral=True,
     )
 
@@ -381,8 +393,8 @@ async def admin_coin(
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT INTO users (guild_id, user_id, coins, voice_minutes)
-        VALUES (?, ?, ?, 0)
+        INSERT INTO users (guild_id, user_id, coins, voice_minutes, warnings)
+        VALUES (?, ?, ?, 0, 0)
         ON CONFLICT(guild_id, user_id) DO UPDATE SET coins = coins + ?
     """,
         (guild_id, target_id, amount, amount),
@@ -419,6 +431,68 @@ async def admin_coin(
         f"⚙️ {action}\n현재 잔액: **{new_coins:,}코인**",
         allowed_mentions=discord.AllowedMentions.none(),
     )
+
+
+@bot.tree.command(
+    name="경고지급",
+    description="[관리자 전용] 특정 유저에게 경고를 부여합니다. (3회 누적 시 자동 차단)",
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    member="경고를 받을 유저", count="부여할 경고 횟수 (기본 1회)"
+)
+async def give_warning(
+    interaction: discord.Interaction, member: discord.Member, count: int = 1
+):
+    await interaction.response.defer(thinking=True)
+
+    if count <= 0:
+        await interaction.followup.send("경고 횟수는 1 이상으로 입력해야 합니다.")
+        return
+
+    guild_id = interaction.guild_id
+    target_id = member.id
+
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO users (guild_id, user_id, coins, voice_minutes, warnings)
+        VALUES (?, ?, 0, 0, ?)
+        ON CONFLICT(guild_id, user_id) DO UPDATE SET warnings = warnings + ?
+        """,
+        (guild_id, target_id, count, count),
+    )
+
+    cursor.execute(
+        "SELECT warnings FROM users WHERE guild_id = ? AND user_id = ?",
+        (guild_id, target_id),
+    )
+    total_warnings = cursor.fetchone()[0]
+    conn.close()
+
+    await log_admin_action(
+        interaction.guild,
+        f"{interaction.user}님이 {member}님에게 경고 {count}회를 부여함 (총 누적: {total_warnings}회)"
+    )
+
+    # 경고 3회 이상 누적 시 자동 차단 처리
+    if total_warnings >= 3:
+        try:
+            await interaction.guild.ban(member, reason=f"경고 3회 누적 자동 차단 (관리자: {interaction.user})")
+            await interaction.followup.send(
+                f"🚨 **[경고 누적 차단]** {member.mention}님이 경고 3회를 초과(`누적 {total_warnings}회`)하여 **서버에서 자동으로 차단(밴)** 되었습니다!"
+            )
+            await log_admin_action(interaction.guild, f"🚨 {member}님이 경고 3회 누적으로 자동 차단됨")
+        except Exception as e:
+            await interaction.followup.send(
+                f"⚠️ 경고가 {total_warnings}회 부여되었으나, 봇의 권한 부족으로 차단에 실패했습니다. (권한을 확인해주세요)\n오류: {e}"
+            )
+    else:
+        await interaction.followup.send(
+            f"⚠️ {member.mention}님에게 경고 **{count}회**가 부여되었습니다. (현재 누적 경고: **{total_warnings}회** / 3회 시 차단)",
+            allowed_mentions=discord.AllowedMentions.none()
+        )
 
 
 @bot.tree.command(
@@ -705,7 +779,7 @@ async def coin_ranking(interaction: discord.Interaction):
 
 
 @bot.tree.command(
-    name="명령어", description="봇에서 사용할 수 있는 명령어 목록을 확인합니다."
+    name="명령어", description="봇이 사용할 수 있는 명령어 목록을 확인합니다."
 )
 async def show_commands(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -716,7 +790,7 @@ async def show_commands(interaction: discord.Interaction):
     embed.add_field(
         name="일반 명령어",
         value=(
-            "`/정보` — 내 코인 잔액과 음성 접속 시간을 확인합니다.\n"
+            "`/정보` — 내 코인 잔액, 음성 접속 시간, 경고 횟수를 확인합니다.\n"
             "`/추천인 [유저]` — 추천인을 등록합니다. 음성 접속 시간이 30분 이상이어야 합니다.\n"
             "`/코인순위` — 이 서버의 코인 보유량 상위 10명을 확인합니다."
         ),
@@ -725,7 +799,8 @@ async def show_commands(interaction: discord.Interaction):
     embed.add_field(
         name="관리자 명령어",
         value=(
-            "`/코인지급 [유저] [수량]` — 코인을 조정합니다. 음수 입력은 차감입니다.\n"
+            "`/코인지급 [유저] [수량]` — 코인을 조정합니다. (음수 입력은 차감)\n"
+            "`/경고지급 [유저] [횟수]` — 경고를 부여합니다. (3회 누적 시 자동 차단)\n"
             "`/보상설정 [수량]` — 음성 접속 누적 30분마다 지급할 코인을 설정합니다.\n"
             "`/추천보상설정 [수량]` — 추천인 등록 성공 시 지급할 코인을 설정합니다.\n"
             "`/코인초기화` — 서버 내 모든 유저의 코인을 공개 경고창을 통해 0으로 초기화합니다.\n"

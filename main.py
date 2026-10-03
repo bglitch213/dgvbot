@@ -283,9 +283,9 @@ async def my_info(
 
     await interaction.response.send_message(
         f"**{target.name}**님의 서버 활동 정보:\n"
-        f"- 🪙대깨 코인: **{coins}개**\n"
-        f"- ⌛음성 접속 시간: **{minutes}분**\n"
-        f"- ⚠️경고 횟수: **{warnings}회** (3회 누적 시 차단)",
+        f"- 🪙 대깨 코인: **{coins}개**\n"
+        f"- ⌛ 음성 접속 시간: **{minutes}분**\n"
+        f"- ⚠️ 경고 횟수: **{warnings}회** (3회 누적 시 차단)",
         ephemeral=True,
     )
 
@@ -435,19 +435,19 @@ async def admin_coin(
 
 @bot.tree.command(
     name="경고지급",
-    description="[관리자 전용] 특정 유저에게 경고를 부여합니다. (3회 누적 시 자동 차단)",
+    description="[관리자 전용] 특정 유저의 경고 횟수를 부여하거나 차감합니다. (음수 입력 시 차감)",
 )
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(
-    member="경고를 받을 유저", count="부여할 경고 횟수 (기본 1회)"
+    member="대상을 선택하세요", count="부여할 횟수 (차감은 마이너스 입력, 예: -1)"
 )
 async def give_warning(
-    interaction: discord.Interaction, member: discord.Member, count: int = 1
+    interaction: discord.Interaction, member: discord.Member, count: int
 ):
     await interaction.response.defer(thinking=True)
 
-    if count <= 0:
-        await interaction.followup.send("경고 횟수는 1 이상으로 입력해야 합니다.")
+    if count == 0:
+        await interaction.followup.send("경고 변동 횟수는 0이 될 수 없습니다. (지급은 양수, 차감은 음수 입력)")
         return
 
     guild_id = interaction.guild_id
@@ -455,13 +455,25 @@ async def give_warning(
 
     conn = get_db()
     cursor = conn.cursor()
+    
+    # 먼저 유저 레코드가 없으면 생성
     cursor.execute(
         """
         INSERT INTO users (guild_id, user_id, coins, voice_minutes, warnings)
-        VALUES (?, ?, 0, 0, ?)
-        ON CONFLICT(guild_id, user_id) DO UPDATE SET warnings = warnings + ?
+        VALUES (?, ?, 0, 0, 0)
+        ON CONFLICT(guild_id, user_id) DO NOTHING
         """,
-        (guild_id, target_id, count, count),
+        (guild_id, target_id),
+    )
+
+    # 경고 횟수 업데이트 (최종 경고가 0 미만으로 내려가지 않도록 MAX(0, ... 처리))
+    cursor.execute(
+        """
+        UPDATE users 
+        SET warnings = MAX(0, warnings + ?)
+        WHERE guild_id = ? AND user_id = ?
+        """,
+        (count, guild_id, target_id)
     )
 
     cursor.execute(
@@ -469,15 +481,20 @@ async def give_warning(
         (guild_id, target_id),
     )
     total_warnings = cursor.fetchone()[0]
+    conn.commit()
     conn.close()
 
-    await log_admin_action(
-        interaction.guild,
-        f"{interaction.user}님이 {member}님에게 경고 {count}회를 부여함 (총 누적: {total_warnings}회)"
-    )
+    if count > 0:
+        action_desc = f"경고 **{count}회**가 부여되었습니다."
+        log_text = f"{interaction.user}님이 {member}님에게 경고 {count}회를 부여함"
+    else:
+        action_desc = f"경고 **{abs(count)}회**가 차감되었습니다."
+        log_text = f"{interaction.user}님이 {member}님의 경고 {abs(count)}회를 차감함"
 
-    # 경고 3회 이상 누적 시 자동 차단 처리
-    if total_warnings >= 3:
+    await log_admin_action(interaction.guild, f"{log_text} (현재 누적: {total_warnings}회)")
+
+    # 경고 3회 이상 누적 시 자동 차단 처리 (양수로 경고가 올라가서 3 이상이 된 경우)
+    if count > 0 and total_warnings >= 3:
         try:
             await interaction.guild.ban(member, reason=f"경고 3회 누적 자동 차단 (관리자: {interaction.user})")
             await interaction.followup.send(
@@ -490,7 +507,7 @@ async def give_warning(
             )
     else:
         await interaction.followup.send(
-            f"⚠️ {member.mention}님에게 경고 **{count}회**가 부여되었습니다. (현재 누적 경고: **{total_warnings}회** / 3회 시 차단)",
+            f"⚠️ {member.mention}님에게 {action_desc} (현재 누적 경고: **{total_warnings}회**)",
             allowed_mentions=discord.AllowedMentions.none()
         )
 
@@ -800,7 +817,7 @@ async def show_commands(interaction: discord.Interaction):
         name="관리자 명령어",
         value=(
             "`/코인지급 [유저] [수량]` — 코인을 조정합니다. (음수 입력은 차감)\n"
-            "`/경고지급 [유저] [횟수]` — 경고를 부여합니다. (3회 누적 시 자동 차단)\n"
+            "`/경고지급 [유저] [횟수]` — 경고를 부여하거나 차감합니다. (음수 입력 시 차감, 3회 누적 시 자동 차단)\n"
             "`/보상설정 [수량]` — 음성 접속 누적 30분마다 지급할 코인을 설정합니다.\n"
             "`/추천보상설정 [수량]` — 추천인 등록 성공 시 지급할 코인을 설정합니다.\n"
             "`/코인초기화` — 서버 내 모든 유저의 코인을 공개 경고창을 통해 0으로 초기화합니다.\n"

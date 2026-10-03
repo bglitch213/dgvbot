@@ -35,7 +35,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 # 1. 데이터베이스 연결 함수
 def get_db():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL 환경 변수가 설정되지 않았습니다!")
+        raise RuntimeError("❌ 에러: DATABASE_URL 환경 변수가 설정되지 않았습니다! Render Environment 설정을 확인해주세요.")
     return psycopg2.connect(DATABASE_URL, sslmode='require')
 
 
@@ -279,7 +279,7 @@ async def my_info(
     defense_tickets = row[3] if row else 0
 
     await interaction.response.send_message(
-        f"**{target.name}**님의 서버 활동 정보:\n"
+        f"**{target.mention}**님의 서버 활동 정보:\n"
         f"- 🪙 대깨 코인: **{coins}개**\n"
         f"- ⌛ 음성 접속 시간: **{minutes}분**\n"
         f"- ⚠️ 경고 횟수: **{warnings}회** (3회 누적 시 차단)\n"
@@ -850,7 +850,7 @@ class ConfirmLogChangeView(discord.ui.View):
         await log_admin_action(interaction.guild, f"{interaction.user}님이 관리자 로그 채널을 이 채널로 변경함")
 
         await interaction.response.edit_message(
-            content=f"🛡️️ [관리자 설정 완료] 이 채널({interaction.channel.mention})이 새로운 관리자 명령어 로그 기록 채널로 변경되었습니다.",
+            content=f"🛡 [관리자 설정 완료] 이 채널({interaction.channel.mention})이 새로운 관리자 명령어 로그 기록 채널로 변경되었습니다.",
             view=self
         )
         self.stop()
@@ -1076,7 +1076,12 @@ async def show_commands(interaction: discord.Interaction):
 
 if __name__ == "__main__":
     keep_alive()
-    token = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
+    
+    # Render 및 일반 환경에서 사용하는 DISCORD_TOKEN을 우선적으로 안전하게 로드합니다.
+    token = os.getenv("DISCORD_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")
+    
     if not token:
-        raise RuntimeError("DISCORD_TOKEN or DISCORD_BOT_TOKEN must be configured.")
+        print("❌ 에러: DISCORD_TOKEN 환경 변수가 설정되지 않았습니다! Render 대시보드의 Environment 설정을 확인해주세요.")
+        exit(1)
+        
     bot.run(token)

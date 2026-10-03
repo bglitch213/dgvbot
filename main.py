@@ -520,7 +520,7 @@ async def admin_coin(
 
 @bot.tree.command(
     name="경고지급",
-    description="[관리자 전용] 특정 유저의 경고 횟수를 부여하거나 차감합니다. (음수 입력 시 차감 및 방어권 전환)",
+    description="[관리자 전용] 특정 유저의 경고 횟수를 부여하거나 차감합니다. (음수 입력 시 차감, 경고 소진 후 방어권 충전)",
 )
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(
@@ -573,6 +573,8 @@ async def give_warning(
         log_text = f"{interaction.user}님이 {member}님에게 경고 {count}회를 부여함"
     else:
         deduct_amount = abs(count)
+        
+        # 💡 수정된 부분: 경고가 남아있다면 경고를 우선 차감하고, 남은 차감 수량이 있을 때만 방어권 충전
         if current_warnings >= deduct_amount:
             new_warnings = current_warnings - deduct_amount
             new_defense = current_defense
@@ -582,8 +584,12 @@ async def give_warning(
             leftover = deduct_amount - current_warnings
             new_warnings = 0
             new_defense = current_defense + leftover
-            action_desc = f"경고가 모두 소진되어, 초과된 **{leftover}회**만큼 **방어권 {leftover}개**로 적립되었습니다."
-            log_text = f"{interaction.user}님이 {member}님의 경고를 차감하고 초과분 {leftover}회를 방어권으로 전환함"
+            if current_warnings > 0:
+                action_desc = f"경고 **{current_warnings}회**가 모두 소진되고, 초과된 **{leftover}회**만큼 **방어권 {leftover}개**로 적립되었습니다."
+                log_text = f"{interaction.user}님이 {member}님의 경고를 모두 차감하고 초과분 {leftover}회를 방어권으로 전환함"
+            else:
+                action_desc = f"보유 중인 경고가 없어, 차감 수량만큼 **방어권 {leftover}개**가 충전되었습니다."
+                log_text = f"{interaction.user}님이 {member}님에게 방어권 {leftover}개를 충전함"
 
         cursor.execute(
             """
@@ -697,7 +703,7 @@ async def set_referral_reward(interaction: discord.Interaction, amount: int):
     await log_admin_action(interaction.guild, f"{interaction.user}님이 추천 보상 코인을 {amount}개로 설정함")
 
     await interaction.followup.send(
-        f"⚙️ [관리자 설정 완료] 추천인 등록 성공 시 추천인에게 **{amount}코인**을 지급합니다."
+        f"⚙️️ [관리자 설정 완료] 추천인 등록 성공 시 추천인에게 **{amount}코인**을 지급합니다."
     )
 
 
@@ -734,7 +740,7 @@ class ConfirmLogChangeView(discord.ui.View):
         await log_admin_action(interaction.guild, f"{interaction.user}님이 관리자 로그 채널을 이 채널로 변경함")
 
         await interaction.response.edit_message(
-            content=f"🛡 [관리자 설정 완료] 이 채널({interaction.channel.mention})이 새로운 관리자 명령어 로그 기록 채널로 변경되었습니다.",
+            content=f"🛡️ [관리자 설정 완료] 이 채널({interaction.channel.mention})이 새로운 관리자 명령어 로그 기록 채널로 변경되었습니다.",
             view=self
         )
         self.stop()
@@ -796,7 +802,7 @@ async def set_log_channel(interaction: discord.Interaction):
         conn.close()
 
         await interaction.response.send_message(
-            f"🛡 [관리자 설정 완료] 이 채널({interaction.channel.mention})이 관리자 명령어 로그 기록 채널로 설정되었습니다."
+            f"🛡️ [관리자 설정 완료] 이 채널({interaction.channel.mention})이 관리자 명령어 로그 기록 채널로 설정되었습니다."
         )
         await log_admin_action(interaction.guild, f"{interaction.user}님이 이 채널을 관리자 로그 채널로 지정함")
 
@@ -944,7 +950,7 @@ async def show_commands(interaction: discord.Interaction):
         value=(
             "• `/채팅청소 [타유저] [수량]` — **관리자 권한**으로 다른 유저의 채팅을 지정한 수량만큼 강제로 청소할 수 있습니다.\n"
             "• `/코인지급 [유저] [수량]` — 특정 유저의 코인을 지급하거나 차감합니다. (차감은 마이너스 입력)\n"
-            "• `/경고지급 [유저] [횟수]` — 경고를 부여하거나 차감합니다. (음수 입력 시 차감 및 방어권 전환, 3회 누적 시 자동 밴)\n"
+            "• `/경고지급 [유저] [횟수]` — 경고를 부여하거나 차감합니다. (음수 입력 시 경고 우선 차감, 소진 후 방어권 충전, 3회 누적 시 자동 밴)\n"
             "• `/보상설정 [수량]` — 음성 채널 누적 30분 이용 시 지급될 코인 양을 설정합니다.\n"
             "• `/추천보상설정 [수량]` — 추천인 등록 성공 시 추천인에게 지급할 코인 수를 설정합니다.\n"
             "• `/코인초기화` — 서버 내 모든 유저의 코인을 공개 경고창을 통해 0으로 초기화합니다.\n"

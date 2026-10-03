@@ -396,7 +396,7 @@ async def admin_coin(
     await log_admin_action(interaction.guild, log_msg)
 
     await interaction.followup.send(
-        f"⚙️ {action}\n현재 잔액: **{new_coins:,}코인**",
+        f"⚙️ {action}\n현재 잔액: **{new_coins:,}대깨코인**",
         allowed_mentions=discord.AllowedMentions.none(),
     )
 

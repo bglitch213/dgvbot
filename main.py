@@ -1,9 +1,29 @@
 import os
 import sqlite3
+import time
+from threading import Thread
+from datetime import datetime, timezone, timedelta
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-from datetime import datetime, timezone, timedelta
+from flask import Flask
+
+# 0. 렌더(Render) 24시간 유지용 Flask 웹서버 설정
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+def run():
+    # Render가 할당해주는 PORT 환경 변수를 사용 (기본값: 10000)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
 
 VOICE_REWARD_INTERVAL_MINUTES = 30
 KST = timezone(timedelta(hours=9)) # 한국 표준시 (UTC+9)
@@ -59,6 +79,7 @@ intents = discord.Intents.default()
 intents.guilds = True
 intents.voice_states = True
 intents.members = True
+intents.message_content = True  # 디스코드 개발자 포털 설정과 일치시킴
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 commands_synced = False
@@ -202,7 +223,6 @@ async def on_voice_state_update(member, before, after):
 
     guild_id = member.guild.id
     user_id = member.id
-    import time
 
     conn = get_db()
     cursor = conn.cursor()
@@ -396,7 +416,7 @@ async def admin_coin(
     await log_admin_action(interaction.guild, log_msg)
 
     await interaction.followup.send(
-        f"⚙️ {action}\n현재 잔액: **{new_coins:,}대깨코인**",
+        f"⚙️ {action}\n현재 잔액: **{new_coins:,}코인**",
         allowed_mentions=discord.AllowedMentions.none(),
     )
 
@@ -433,7 +453,7 @@ async def set_voice_reward(interaction: discord.Interaction, amount: int):
     await log_admin_action(interaction.guild, f"{interaction.user}님이 음성 30분당 보상 코인을 {amount}개로 설정함")
 
     await interaction.followup.send(
-        f"⚙️️ [관리자 설정 완료] 앞으로 음성 채널 누적 **30분마다 {amount}코인**이 지급됩니다."
+        f"⚙ [관리자 설정 완료] 앞으로 음성 채널 누적 **30분마다 {amount}코인**이 지급됩니다."
     )
 
 
@@ -721,7 +741,9 @@ async def show_commands(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-token = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
-if not token:
-    raise RuntimeError("DISCORD_TOKEN or DISCORD_BOT_TOKEN must be configured.")
-bot.run(token)
+if __name__ == "__main__":
+    keep_alive() # Flask 서버 가동 (Render 포트 바인딩 해결)
+    token = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
+    if not token:
+        raise RuntimeError("DISCORD_TOKEN or DISCORD_BOT_TOKEN must be configured.")
+    bot.run(token)

@@ -286,7 +286,7 @@ async def my_info(
         f"- 🪙 대깨 코인: **{coins}개**\n"
         f"- ⌛ 음성 접속 시간: **{minutes}분**\n"
         f"- ⚠️ 경고 횟수: **{warnings}회** (3회 누적 시 차단)\n"
-        f"- 🛡️ 방어권: **{defense_tickets}개**",
+        f"- 🛡️️ 방어권: **{defense_tickets}개**",
         ephemeral=True,
     )
 
@@ -402,7 +402,6 @@ async def clear_chat(
 
     try:
         messages_to_delete = []
-        # 탐색 범위를 최근 1000개 메시지로 확장하여 지정한 수량만큼 확실히 수집하도록 수정
         async for message in channel.history(limit=1000):
             if message.author.id == target.id:
                 messages_to_delete.append(message)
@@ -451,6 +450,55 @@ async def clear_chat(
 
     except Exception as e:
         await interaction.followup.send(f"⚠️ 메시지 청소 중 오류가 발생했습니다: {e}", ephemeral=True)
+
+
+@bot.tree.command(
+    name="전체청소",
+    description="[관리자 전용] 현재 채널의 모든 채팅(최대 1000개)을 싹 비웁니다.",
+)
+@app_commands.default_permissions(administrator=True)
+async def clear_all_chat(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True, ephemeral=False)
+
+    channel = interaction.channel
+    now = datetime.now(timezone.utc)
+    two_weeks_ago = now - timedelta(days=14)
+    deleted_total = 0
+
+    try:
+        while True:
+            messages = [msg async for msg in channel.history(limit=100)]
+            if not messages:
+                break
+
+            bulk_list = [msg for msg in messages if msg.created_at > two_weeks_ago]
+            old_list = [msg for msg in messages if msg.created_at <= two_weeks_ago]
+
+            if bulk_list:
+                if len(bulk_list) == 1:
+                    await bulk_list[0].delete()
+                else:
+                    await channel.delete_messages(bulk_list)
+                deleted_total += len(bulk_list)
+
+            for msg in old_list:
+                try:
+                    await msg.delete()
+                    deleted_total += 1
+                    await asyncio.sleep(0.5)
+                except Exception:
+                    pass
+
+            if len(messages) < 100:
+                break
+
+        await interaction.followup.send(
+            f"🧹 **[전체 청소 완료]** {interaction.user.mention}님에 의해 이 채널의 메시지 **{deleted_total}개**가 모두 청소되었습니다!"
+        )
+        await log_admin_action(interaction.guild, f"{interaction.user}님이 채널({channel.name})의 전체 메시지 {deleted_total}개를 청소함")
+
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ 전체 채널 청소 중 오류가 발생했습니다: {e}", ephemeral=True)
 
 
 @bot.tree.command(
@@ -961,6 +1009,7 @@ async def show_commands(interaction: discord.Interaction):
         name="🛡️ 관리자 전용 명령어",
         value=(
             "• `/채팅청소 [타유저] [수량]` — **관리자 권한**으로 다른 유저의 채팅을 지정한 수량만큼 강제로 청소할 수 있습니다. (공개 출력)\n"
+            "• `/전체청소` — **관리자 권한**으로 현재 채널의 모든 채팅을 싹 비우고 완료 메시지를 남깁니다.\n"
             "• `/코인지급 [유저] [수량]` — 특정 유저의 코인을 지급하거나 차감합니다. (차감은 마이너스 입력)\n"
             "• `/경고지급 [유저] [횟수]` — 경고를 부여하거나 차감합니다. (방어권 우선 소모, 음수 입력 시 경고 차감/방어권 충전, 3회 누적 시 자동 밴)\n"
             "• `/보상설정 [수량]` — 음성 채널 누적 30분 이용 시 지급될 코인 양을 설정합니다.\n"

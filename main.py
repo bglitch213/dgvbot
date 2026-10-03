@@ -232,7 +232,7 @@ async def check_coins(ctx, amount: int = None):
                 (amount, guild_id, user_id)
             )
             conn.commit()
-            await ctx.send(f"✅ {ctx.author.mention님에게 {amount} 코인이 추가되었습니다!")
+            await ctx.send(f"✅ {ctx.author.mention}님에게 {amount} 코인이 추가되었습니다!")
         else:
             # 현재 코인 조회
             cursor.execute(

@@ -381,7 +381,6 @@ async def register_referral(interaction: discord.Interaction, referrer: discord.
 async def clear_chat(
     interaction: discord.Interaction, member: discord.Member = None, count: int = 10
 ):
-    # 상호작용 지연 처리 (공개/비공개 결정을 위해 ephemeral 인자는 일단 사용하지 않음)
     await interaction.response.defer(thinking=True, ephemeral=False)
 
     if count < 1 or count > 100:
@@ -395,7 +394,6 @@ async def clear_chat(
         await interaction.followup.send("❌ 일반 사용자는 **본인의 채팅만** 청소할 수 있습니다.", ephemeral=True)
         return
 
-    # 관리자가 다른 사람을 지우는 경우인지 여부 판단
     is_admin_clearing_others = is_admin and target.id != interaction.user.id
 
     channel = interaction.channel
@@ -404,7 +402,8 @@ async def clear_chat(
 
     try:
         messages_to_delete = []
-        async for message in channel.history(limit=200):
+        # 탐색 범위를 최근 1000개 메시지로 확장하여 지정한 수량만큼 확실히 수집하도록 수정
+        async for message in channel.history(limit=1000):
             if message.author.id == target.id:
                 messages_to_delete.append(message)
                 if len(messages_to_delete) >= count:
@@ -439,15 +438,13 @@ async def clear_chat(
             except Exception:
                 pass
 
-        # 💡 [핵심 분기] 관리자가 타인의 채팅을 지운 경우 -> 공개 채널에 전체 메시지 출력
         if is_admin_clearing_others:
             await interaction.followup.send(
                 f"🧹 **[관리자 청소]** {interaction.user.mention}님이 {target.mention}님의 메시지 **{deleted_count}개**를 삭제했습니다!"
             )
             await log_admin_action(interaction.guild, f"{interaction.user}님이 {target}님의 메시지 {deleted_count}개를 채널({channel.name})에서 청소함")
         else:
-            # 본인 채팅을 지운 경우 -> 혼자만 보게 처리 (ephemeral 효과를 위해 후속 메시지 전송 후 잠시 뒤 삭제하거나 메시지 안내)
-            msg_res = await interaction.followup.send(
+            await interaction.followup.send(
                 f"🧹 본인의 메시지 **{deleted_count}개**를 청소했습니다!",
                 ephemeral=True
             )

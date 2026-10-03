@@ -6,7 +6,7 @@ from discord.ext import commands, tasks
 from datetime import datetime, timezone, timedelta
 
 VOICE_REWARD_INTERVAL_MINUTES = 30
-KST = timezone(timedelta(hours=9))  # 한국 표준시 (UTC+9)
+KST = timezone(timedelta(hours=9)) # 한국 표준시 (UTC+9)
 
 
 # 1. 데이터베이스 초기화 및 연결 함수
@@ -72,9 +72,7 @@ def get_db():
 async def log_admin_action(guild: discord.Guild, action_text: str):
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT log_channel_id FROM guild_settings WHERE guild_id = ?", (guild.id,)
-    )
+    cursor.execute("SELECT log_channel_id FROM guild_settings WHERE guild_id = ?", (guild.id,))
     row = cursor.fetchone()
     conn.close()
 
@@ -85,14 +83,14 @@ async def log_admin_action(guild: discord.Guild, action_text: str):
             embed = discord.Embed(
                 title="🛡 관리자 명령어 실행 기록",
                 description=f"**내용:** {action_text}\n**시간:** {now}",
-                color=discord.Color.orange(),
+                color=discord.Color.orange()
             )
             try:
                 async for message in channel.history(limit=1):
                     if message.embeds and message.embeds[0].description:
                         if action_text in message.embeds[0].description:
                             return
-
+                
                 await channel.send(embed=embed)
             except Exception as e:
                 print(f"로그 전송 중 오류 발생: {e}")
@@ -104,25 +102,15 @@ async def on_ready():
     print(f"로그인 완료: {bot.user}")
 
     if not commands_synced:
-        global_commands = bot.tree.get_commands()
         try:
             for guild in bot.guilds:
                 bot.tree.clear_commands(guild=guild)
                 bot.tree.copy_global_to(guild=guild)
-
-            bot.tree.clear_commands(guild=None)
-            await bot.tree.sync()
-
-            for guild in bot.guilds:
                 synced = await bot.tree.sync(guild=guild)
                 print(f"[{guild.name}] 서버 명령어 동기화 완료: {len(synced)}개")
             commands_synced = True
         except Exception as e:
             print(f"명령어 동기화 중 오류 발생: {e}")
-        finally:
-            for command in global_commands:
-                if bot.tree.get_command(command.name) is None:
-                    bot.tree.add_command(command)
 
     if not check_voice_time.is_running():
         check_voice_time.start()
@@ -136,7 +124,7 @@ async def on_guild_join(guild: discord.Guild):
     print(f"[{guild.name}] 서버 명령어 동기화 완료: {len(synced)}개")
 
 
-# 2. 매분 음성 채널 접속 유저 확인 및 보상 지급 (중복 지급 방지 로직 적용)
+# 2. 매분 음성 채널 접속 유저 확인 및 보상 지급 (마이크/헤드셋 음소거 시 제외)
 @tasks.loop(minutes=1)
 async def check_voice_time():
     conn = get_db()
@@ -151,7 +139,14 @@ async def check_voice_time():
             continue
         member = guild.get_member(user_id)
 
-        if member and member.voice and member.voice.channel and not member.bot:
+        if (
+            member 
+            and member.voice 
+            and member.voice.channel 
+            and not member.bot
+            and not member.voice.self_mute
+            and not member.voice.self_deaf
+        ):
             cursor.execute(
                 "SELECT voice_reward_rate FROM guild_settings WHERE guild_id = ?",
                 (guild_id,),
@@ -166,17 +161,17 @@ async def check_voice_time():
                 """,
                 (guild_id, user_id),
             )
-
+            
             cursor.execute(
                 "SELECT coins, voice_minutes FROM users WHERE guild_id = ? AND user_id = ?",
-                (guild_id, user_id),
+                (guild_id, user_id)
             )
             user_row = cursor.fetchone()
             current_coins = user_row[0]
             current_minutes = user_row[1]
-
+            
             new_minutes = current_minutes + 1
-
+            
             added_coins = 0
             if new_minutes > 0 and new_minutes % VOICE_REWARD_INTERVAL_MINUTES == 0:
                 added_coins = reward_rate
@@ -188,7 +183,7 @@ async def check_voice_time():
                     voice_minutes = ?
                 WHERE guild_id = ? AND user_id = ?
                 """,
-                (added_coins, new_minutes, guild_id, user_id),
+                (added_coins, new_minutes, guild_id, user_id)
             )
         else:
             cursor.execute(
@@ -212,15 +207,18 @@ async def on_voice_state_update(member, before, after):
     conn = get_db()
     cursor = conn.cursor()
 
-    if before.channel is None and after.channel is not None:
+    is_connected = after.channel is not None
+    is_muted_or_deafed = after.self_mute or after.self_deaf
+
+    if is_connected and not is_muted_or_deafed:
         cursor.execute(
             """
             INSERT OR REPLACE INTO voice_sessions (guild_id, user_id, join_time)
             VALUES (?, ?, ?)
-        """,
+            """,
             (guild_id, user_id, time.time()),
         )
-    elif before.channel is not None and after.channel is None:
+    else:
         cursor.execute(
             "DELETE FROM voice_sessions WHERE guild_id = ? AND user_id = ?",
             (guild_id, user_id),
@@ -230,13 +228,14 @@ async def on_voice_state_update(member, before, after):
     conn.close()
 
 
-# 3. 슬래시 명령어 그룹
+# 3. 슬래시 명령어 그룹 (일반 명령어)
 @bot.tree.command(
-    name="정보",
-    description="본인 또는 선택한 사용자의 코인과 음성 접속 시간을 확인합니다.",
+    name="정보", description="본인 또는 선택한 사용자의 코인과 음성 접속 시간을 확인합니다."
 )
 @app_commands.describe(member="조회할 사용자 (선택하지 않으면 본인)")
-async def my_info(interaction: discord.Interaction, member: discord.Member = None):
+async def my_info(
+    interaction: discord.Interaction, member: discord.Member = None
+):
     target = member or interaction.user
     guild_id = interaction.guild_id
     user_id = target.id
@@ -338,7 +337,10 @@ async def register_referral(interaction: discord.Interaction, referrer: discord.
     )
 
 
-# 관리자 명령어 1: 코인 지급
+# ----------------------------------------------------
+# 관리자 명령어들 (default_permissions로 관리자 외 목록 비노출 처리)
+# ----------------------------------------------------
+
 @bot.tree.command(
     name="코인지급",
     description="[관리자 전용] 특정 유저의 코인을 지급하거나 차감합니다.",
@@ -351,7 +353,7 @@ async def admin_coin(
     interaction: discord.Interaction, member: discord.Member, amount: int
 ):
     await interaction.response.defer(thinking=True)
-
+    
     guild_id = interaction.guild_id
     target_id = member.id
 
@@ -399,7 +401,6 @@ async def admin_coin(
     )
 
 
-# 관리자 명령어 2: 보상 설정
 @bot.tree.command(
     name="보상설정",
     description="[관리자 전용] 음성 채널 30분 이용 시 지급될 코인 양을 설정합니다.",
@@ -408,7 +409,7 @@ async def admin_coin(
 @app_commands.describe(amount="음성 채널을 누적 30분 이용할 때 지급할 코인 수")
 async def set_voice_reward(interaction: discord.Interaction, amount: int):
     await interaction.response.defer(thinking=True)
-
+    
     if amount < 0:
         await interaction.followup.send("보상 코인은 0 이상으로 설정해야 합니다.")
         return
@@ -429,28 +430,22 @@ async def set_voice_reward(interaction: discord.Interaction, amount: int):
     conn.commit()
     conn.close()
 
-    await log_admin_action(
-        interaction.guild,
-        f"{interaction.user}님이 음성 30분당 보상 코인을 {amount}개로 설정함",
-    )
+    await log_admin_action(interaction.guild, f"{interaction.user}님이 음성 30분당 보상 코인을 {amount}개로 설정함")
 
     await interaction.followup.send(
-        f"⚙️ [관리자 설정 완료] 앞으로 음성 채널 누적 **30분마다 {amount}코인**이 지급됩니다."
+        f"⚙️️ [관리자 설정 완료] 앞으로 음성 채널 누적 **30분마다 {amount}코인**이 지급됩니다."
     )
 
 
-# 관리자 명령어 3: 추천 보상 설정
 @bot.tree.command(
     name="추천보상설정",
     description="[관리자 전용] 추천인 등록 시 추천인에게 지급되는 코인 수를 설정합니다.",
 )
 @app_commands.default_permissions(administrator=True)
-@app_commands.describe(
-    amount="추천인 등록이 성공할 때 추천인에게 지급할 코인 수 (0 이상)"
-)
+@app_commands.describe(amount="추천인 등록이 성공할 때 추천인에게 지급할 코인 수 (0 이상)")
 async def set_referral_reward(interaction: discord.Interaction, amount: int):
     await interaction.response.defer(thinking=True)
-
+    
     if amount < 0:
         await interaction.followup.send("추천 보상 코인은 0 이상으로 설정해야 합니다.")
         return
@@ -468,19 +463,14 @@ async def set_referral_reward(interaction: discord.Interaction, amount: int):
     conn.commit()
     conn.close()
 
-    await log_admin_action(
-        interaction.guild,
-        f"{interaction.user}님이 추천 보상 코인을 {amount}개로 설정함",
-    )
+    await log_admin_action(interaction.guild, f"{interaction.user}님이 추천 보상 코인을 {amount}개로 설정함")
 
     await interaction.followup.send(
         f"⚙️ [관리자 설정 완료] 추천인 등록 성공 시 추천인에게 **{amount}코인**을 지급합니다."
     )
 
 
-# ----------------------------------------------------
-# 로그 채널 변경 확인 버튼 뷰(View) 클래스
-# ----------------------------------------------------
+# 로그 채널 변경 확인 버튼 뷰
 class ConfirmLogChangeView(discord.ui.View):
     def __init__(self, author_id: int, guild_id: int, new_channel_id: int):
         super().__init__(timeout=60)
@@ -489,13 +479,9 @@ class ConfirmLogChangeView(discord.ui.View):
         self.new_channel_id = new_channel_id
 
     @discord.ui.button(label="변경하기", style=discord.ButtonStyle.danger)
-    async def confirm_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                "명령어를 실행한 관리자만 누를 수 있습니다.", ephemeral=True
-            )
+            await interaction.response.send_message("명령어를 실행한 관리자만 누를 수 있습니다.", ephemeral=True)
             return
 
         conn = get_db()
@@ -514,25 +500,18 @@ class ConfirmLogChangeView(discord.ui.View):
         for child in self.children:
             child.disabled = True
 
-        await log_admin_action(
-            interaction.guild,
-            f"{interaction.user}님이 관리자 로그 채널을 이 채널로 변경함",
-        )
+        await log_admin_action(interaction.guild, f"{interaction.user}님이 관리자 로그 채널을 이 채널로 변경함")
 
         await interaction.response.edit_message(
-            content=f"🛡️️ [관리자 설정 완료] 이 채널({interaction.channel.mention})이 새로운 관리자 명령어 로그 기록 채널로 변경되었습니다.",
-            view=self,
+            content=f"🛡 [관리자 설정 완료] 이 채널({interaction.channel.mention})이 새로운 관리자 명령어 로그 기록 채널로 변경되었습니다.",
+            view=self
         )
         self.stop()
 
     @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
-    async def cancel_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                "명령어를 실행한 관리자만 누를 수 있습니다.", ephemeral=True
-            )
+            await interaction.response.send_message("명령어를 실행한 관리자만 누를 수 있습니다.", ephemeral=True)
             return
 
         for child in self.children:
@@ -540,12 +519,11 @@ class ConfirmLogChangeView(discord.ui.View):
 
         await interaction.response.edit_message(
             content=f"❌ 로그 채널 변경이 취소되었습니다. 기존 로그 채널이 유지됩니다.",
-            view=self,
+            view=self
         )
         self.stop()
 
 
-# 관리자 명령어 4: 로그 채널 설정 (공개 메시지로 변경)
 @bot.tree.command(
     name="로그",
     description="[관리자 전용] 관리자 명령어 실행 기록이 남을 채널을 현재 채널로 설정합니다.",
@@ -557,30 +535,22 @@ async def set_log_channel(interaction: discord.Interaction):
 
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT log_channel_id FROM guild_settings WHERE guild_id = ?", (guild_id,)
-    )
+    cursor.execute("SELECT log_channel_id FROM guild_settings WHERE guild_id = ?", (guild_id,))
     row = cursor.fetchone()
     conn.close()
 
-    # 이미 지정된 로그 채널이 있는 경우 (공개 메시지로 출력)
     if row and row[0]:
         existing_channel_id = row[0]
         existing_channel = interaction.guild.get_channel(existing_channel_id)
-        existing_channel_mention = (
-            existing_channel.mention
-            if existing_channel
-            else f"<#{existing_channel_id}>"
-        )
+        existing_channel_mention = existing_channel.mention if existing_channel else f"<#{existing_channel_id}>"
 
         view = ConfirmLogChangeView(interaction.user.id, guild_id, channel_id)
         await interaction.response.send_message(
             f"⚠️ **이미 이 서버에는 지정된 관리자 로그 채널({existing_channel_mention})이 존재합니다!**\n"
             f"새로운 채널({interaction.channel.mention})로 로그 채널을 변경하시겠습니까?",
-            view=view,
+            view=view
         )
     else:
-        # 지정된 채널이 없으면 바로 공개 메시지로 설정 완료 안내
         conn = get_db()
         cursor = conn.cursor()
         cursor.execute(
@@ -595,30 +565,21 @@ async def set_log_channel(interaction: discord.Interaction):
         conn.close()
 
         await interaction.response.send_message(
-            f"🛡️️ [관리자 설정 완료] 이 채널({interaction.channel.mention})이 관리자 명령어 로그 기록 채널로 설정되었습니다."
+            f"🛡 [관리자 설정 완료] 이 채널({interaction.channel.mention})이 관리자 명령어 로그 기록 채널로 설정되었습니다."
         )
-        await log_admin_action(
-            interaction.guild,
-            f"{interaction.user}님이 이 채널을 관리자 로그 채널로 지정함",
-        )
+        await log_admin_action(interaction.guild, f"{interaction.user}님이 이 채널을 관리자 로그 채널로 지정함")
 
 
-# ----------------------------------------------------
-# 공개 코인 초기화 확인 버튼 뷰(View) 클래스
-# ----------------------------------------------------
+# 코인 초기화 확인 버튼 뷰
 class ConfirmResetView(discord.ui.View):
     def __init__(self, author_id: int):
         super().__init__(timeout=60)
         self.author_id = author_id
 
     @discord.ui.button(label="확인 (초기화 진행)", style=discord.ButtonStyle.danger)
-    async def confirm_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                "명령어를 실행한 관리자만 누를 수 있습니다.", ephemeral=True
-            )
+            await interaction.response.send_message("명령어를 실행한 관리자만 누를 수 있습니다.", ephemeral=True)
             return
 
         guild_id = interaction.guild_id
@@ -631,57 +592,44 @@ class ConfirmResetView(discord.ui.View):
         for child in self.children:
             child.disabled = True
 
-        await log_admin_action(
-            interaction.guild,
-            f"{interaction.user}님이 서버 내 모든 유저의 코인 전체 초기화를 최종 승인 및 실행함",
-        )
+        await log_admin_action(interaction.guild, f"{interaction.user}님이 서버 내 모든 유저의 코인 전체 초기화를 최종 승인 및 실행함")
 
         await interaction.response.edit_message(
             content=f"⚠️ **[관리자 초기화 완료]** {interaction.user.mention}님이 이 서버의 모든 유저 코인을 **0개**로 초기화했습니다.",
-            view=self,
+            view=self
         )
         self.stop()
 
     @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
-    async def cancel_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                "명령어를 실행한 관리자만 누를 수 있습니다.", ephemeral=True
-            )
+            await interaction.response.send_message("명령어를 실행한 관리자만 누를 수 있습니다.", ephemeral=True)
             return
 
         for child in self.children:
             child.disabled = True
 
-        await log_admin_action(
-            interaction.guild, f"{interaction.user}님이 코인 전체 초기화 요청을 취소함"
-        )
+        await log_admin_action(interaction.guild, f"{interaction.user}님이 코인 전체 초기화 요청을 취소함")
 
         await interaction.response.edit_message(
             content=f"❌ {interaction.user.mention}님에 의해 코인 초기화가 취소되었습니다.",
-            view=self,
+            view=self
         )
         self.stop()
 
 
-# 관리자 명령어 5: 코인 전체 초기화
 @bot.tree.command(
     name="코인초기화",
     description="[관리자 전용] 이 서버의 모든 유저 코인을 공개 경고창을 통해 0으로 초기화합니다.",
 )
 @app_commands.default_permissions(administrator=True)
 async def reset_all_coins(interaction: discord.Interaction):
-    await log_admin_action(
-        interaction.guild,
-        f"{interaction.user}님이 코인 전체 초기화 명령어를 실행(요청)함",
-    )
+    await log_admin_action(interaction.guild, f"{interaction.user}님이 코인 전체 초기화 명령어를 실행(요청)함")
 
     view = ConfirmResetView(interaction.user.id)
     await interaction.response.send_message(
         f"⚠️ **{interaction.user.mention}님이 코인 전체 초기화를 요청했습니다!**\n정말로 이 서버의 모든 유저 코인을 0으로 초기화하시겠습니까? 이 작업은 되돌릴 수 없습니다.",
-        view=view,
+        view=view
     )
 
 
@@ -760,8 +708,8 @@ async def show_commands(interaction: discord.Interaction):
             "`/코인지급 [유저] [수량]` — 코인을 조정합니다. 음수 입력은 차감입니다.\n"
             "`/보상설정 [수량]` — 음성 접속 누적 30분마다 지급할 코인을 설정합니다.\n"
             "`/추천보상설정 [수량]` — 추천인 등록 성공 시 지급할 코인을 설정합니다.\n"
-            "`/코인초기화` — 서버 내 모든 유저의 코인을 공개 경고창을 통해 0으로 초기화합니다 (요청 및 실행 로그 기록).\n"
-            "`/로그` — 관리자 명령어 실행 기록을 남길 채널을 설정합니다. (이미 설정된 채널이 있으면 공개 창에서 변경 여부 확인)"
+            "`/코인초기화` — 서버 내 모든 유저의 코인을 공개 경고창을 통해 0으로 초기화합니다.\n"
+            "`/로그` — 관리자 명령어 실행 기록을 남길 채널을 설정합니다."
         ),
         inline=False,
     )
@@ -773,34 +721,7 @@ async def show_commands(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-import os
-from flask import Flask
-from threading import Thread
-
-app = Flask("")
-
-
-@app.route("/")
-def home():
-    return "I'm alive!"
-
-
-def run():
-    # 리플릿이 지정해주는 포트를 우선적으로 사용하고, 없으면 3000번을 씁니다.
-    port = int(os.environ.get("PORT", 3000))
-    app.run(host="0.0.0.0", port=port)
-
-
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
-
-
-if __name__ == "__main__":
-    keep_alive()
-    token = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
-    if not token:
-        raise RuntimeError(
-            "DISCORD_TOKEN or DISCORD_BOT_TOKEN must be configured in Replit Secrets."
-        )
-    bot.run(token)
+token = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
+if not token:
+    raise RuntimeError("DISCORD_TOKEN or DISCORD_BOT_TOKEN must be configured.")
+bot.run(token)

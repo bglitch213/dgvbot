@@ -114,7 +114,7 @@ async def log_admin_action(guild: discord.Guild, action_text: str):
         if channel:
             now = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
             embed = discord.Embed(
-                title="🛡️ 관리자 명령어 실행 기록",
+                title="🛡 관리자 명령어 실행 기록",
                 description=f"**내용:** {action_text}\n**시간:** {now}",
                 color=discord.Color.orange()
             )
@@ -291,7 +291,7 @@ async def my_info(
         f"- 🪙 대깨 코인: **{coins}개**\n"
         f"- ⌛ 음성 접속 시간: **{minutes}분**\n"
         f"- ⚠️ 경고 횟수: **{warnings}회** (3회 누적 시 차단)\n"
-        f"- 🛡️ 경고 방어권: **{defense_tickets}개**",
+        f"- 🛡 방어권: **{defense_tickets}개**",
         ephemeral=True,
     )
 
@@ -440,12 +440,14 @@ async def clear_chat(
             except Exception:
                 pass
 
+        # 🧹 누가 몇 개의 메시지를 지웠는지 명시하여 출력
         await interaction.followup.send(
-            f"🧹 **{target.name}**님의 메시지 **{deleted_count}개**를 성공적으로 청소했습니다!",
+            f"🧹 **{interaction.user.name}**님이 **{target.name}**님의 메시지 **{deleted_count}개**를 성공적으로 청소했습니다!",
             ephemeral=True
         )
 
-        if is_admin and target.id != interaction.user.id:
+        # 관리자일 경우 타인의 채팅을 지웠다면 로그 채널에 기록
+        if is_admin:
             await log_admin_action(interaction.guild, f"{interaction.user}님이 {target}님의 메시지 {deleted_count}개를 채널({channel.name})에서 청소함")
 
     except Exception as e:
@@ -602,22 +604,30 @@ async def give_warning(
     total_defense = final_row[1]
     conn.close()
 
-    await log_admin_action(interaction.guild, f"{log_text} (현재 누적 경고: {total_warnings}회, 방어권: {total_defense}개)")
+    # 🛡️ 로그 채널에 현재 경고 및 방어권 횟수 전체가 표시되도록 기록 상세화
+    detailed_log_text = f"{log_text} (현재 누적 경고: **{total_warnings}회**, 방어권: **{total_defense}개**)"
+    await log_admin_action(interaction.guild, detailed_log_text)
 
     if count > 0 and total_warnings >= 3:
         try:
             await interaction.guild.ban(member, reason=f"경고 3회 누적 자동 차단 (관리자: {interaction.user})")
+            ban_log_msg = f"🚨 {member}님이 경고 3회 누적으로 자동 차단됨 (최종 경고: {total_warnings}회)"
+            await log_admin_action(interaction.guild, ban_log_msg)
+            
             await interaction.followup.send(
-                f"🚨 **[경고 누적 차단]** {member.mention}님이 경고 3회를 초과(`누적 {total_warnings}회`)하여 **서버에서 자동으로 차단(밴)** 되었습니다!"
+                f"🚨 **[경고 누적 차단]** {member.mention}님이 경고 3회를 초과(`누적 {total_warnings}회`)하여 **서버에서 자동으로 차단(밴)** 되었습니다!\n"
+                f"📊 대상자 현재 상태 — 경고: **{total_warnings}회**, 방어권: **{total_defense}개**"
             )
-            await log_admin_action(interaction.guild, f"🚨 {member}님이 경고 3회 누적으로 자동 차단됨")
         except Exception as e:
             await interaction.followup.send(
-                f"⚠️ 경고가 {total_warnings}회 부여되었으나, 봇의 권한 부족으로 차단에 실패했습니다. (권한을 확인해주세요)\n오류: {e}"
+                f"⚠️ 경고가 {total_warnings}회 부여되었으나, 봇의 권한 부족으로 차단에 실패했습니다. (권한을 확인해주세요)\n오류: {e}\n"
+                f"📊 대상자 현재 상태 — 경고: **{total_warnings}회**, 방어권: **{total_defense}개**"
             )
     else:
+        # ⚠️ 경고 지급 후 그 사람의 경고 횟수를 전부 표시
         await interaction.followup.send(
-            f"⚠️ {member.mention}님에게 {action_desc} (현재 누적 경고: **{total_warnings}회**, 방어권: **{total_defense}개**)",
+            f"⚠️ {member.mention}님에게 {action_desc}\n"
+            f"📊 대상자 현재 상태 — 경고: **{total_warnings}회**, 방어권: **{total_defense}개**",
             allowed_mentions=discord.AllowedMentions.none()
         )
 

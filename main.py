@@ -91,7 +91,6 @@ intents.voice_states = True
 intents.members = True
 intents.message_content = True
 
-# 💡 봇 객체 선언을 데코레이터 및 명령어 정의보다 위로 배치하여 NameError 방지
 bot = commands.Bot(command_prefix="!", intents=intents)
 commands_synced = False
 
@@ -382,7 +381,8 @@ async def register_referral(interaction: discord.Interaction, referrer: discord.
 async def clear_chat(
     interaction: discord.Interaction, member: discord.Member = None, count: int = 10
 ):
-    await interaction.response.defer(ephemeral=True)
+    # 상호작용 지연 처리 (공개/비공개 결정을 위해 ephemeral 인자는 일단 사용하지 않음)
+    await interaction.response.defer(thinking=True, ephemeral=False)
 
     if count < 1 or count > 100:
         await interaction.followup.send("❌ 삭제할 수량은 **1개 이상 100개 이하**로 입력해주세요.", ephemeral=True)
@@ -394,6 +394,9 @@ async def clear_chat(
     if not is_admin and target.id != interaction.user.id:
         await interaction.followup.send("❌ 일반 사용자는 **본인의 채팅만** 청소할 수 있습니다.", ephemeral=True)
         return
+
+    # 관리자가 다른 사람을 지우는 경우인지 여부 판단
+    is_admin_clearing_others = is_admin and target.id != interaction.user.id
 
     channel = interaction.channel
     deleted_count = 0
@@ -436,13 +439,18 @@ async def clear_chat(
             except Exception:
                 pass
 
-        await interaction.followup.send(
-            f"🧹 **{interaction.user.name}**님이 **{target.name}**님의 메시지 **{deleted_count}개**를 성공적으로 청소했습니다!",
-            ephemeral=True
-        )
-
-        if is_admin:
+        # 💡 [핵심 분기] 관리자가 타인의 채팅을 지운 경우 -> 공개 채널에 전체 메시지 출력
+        if is_admin_clearing_others:
+            await interaction.followup.send(
+                f"🧹 **[관리자 청소]** {interaction.user.mention}님이 {target.mention}님의 메시지 **{deleted_count}개**를 삭제했습니다!"
+            )
             await log_admin_action(interaction.guild, f"{interaction.user}님이 {target}님의 메시지 {deleted_count}개를 채널({channel.name})에서 청소함")
+        else:
+            # 본인 채팅을 지운 경우 -> 혼자만 보게 처리 (ephemeral 효과를 위해 후속 메시지 전송 후 잠시 뒤 삭제하거나 메시지 안내)
+            msg_res = await interaction.followup.send(
+                f"🧹 본인의 메시지 **{deleted_count}개**를 청소했습니다!",
+                ephemeral=True
+            )
 
     except Exception as e:
         await interaction.followup.send(f"⚠️ 메시지 청소 중 오류가 발생했습니다: {e}", ephemeral=True)
@@ -548,7 +556,6 @@ async def give_warning(
     current_warnings = row[0]
     current_defense = row[1]
 
-    # 🛡️ 방어권 우선 소모 로직 반영
     if count > 0:
         applied_warnings_count = 0
         used_defense_count = 0
@@ -956,7 +963,7 @@ async def show_commands(interaction: discord.Interaction):
     embed.add_field(
         name="🛡️ 관리자 전용 명령어",
         value=(
-            "• `/채팅청소 [타유저] [수량]` — **관리자 권한**으로 다른 유저의 채팅을 지정한 수량만큼 강제로 청소할 수 있습니다.\n"
+            "• `/채팅청소 [타유저] [수량]` — **관리자 권한**으로 다른 유저의 채팅을 지정한 수량만큼 강제로 청소할 수 있습니다. (공개 출력)\n"
             "• `/코인지급 [유저] [수량]` — 특정 유저의 코인을 지급하거나 차감합니다. (차감은 마이너스 입력)\n"
             "• `/경고지급 [유저] [횟수]` — 경고를 부여하거나 차감합니다. (방어권 우선 소모, 음수 입력 시 경고 차감/방어권 충전, 3회 누적 시 자동 밴)\n"
             "• `/보상설정 [수량]` — 음성 채널 누적 30분 이용 시 지급될 코인 양을 설정합니다.\n"

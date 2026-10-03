@@ -41,6 +41,7 @@ def init_db():
             voice_minutes INTEGER DEFAULT 0,
             referred_by INTEGER DEFAULT NULL,
             warnings INTEGER DEFAULT 0,
+            defense_tickets INTEGER DEFAULT 0,
             PRIMARY KEY (guild_id, user_id)
         )
     """)
@@ -66,6 +67,8 @@ def init_db():
     users_columns = {row[1] for row in cursor.fetchall()}
     if "warnings" not in users_columns:
         cursor.execute("ALTER TABLE users ADD COLUMN warnings INTEGER DEFAULT 0")
+    if "defense_tickets" not in users_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN defense_tickets INTEGER DEFAULT 0")
 
     cursor.execute("PRAGMA table_info(guild_settings)")
     settings_columns = {row[1] for row in cursor.fetchall()}
@@ -185,8 +188,8 @@ async def check_voice_time():
 
             cursor.execute(
                 """
-                INSERT OR IGNORE INTO users (guild_id, user_id, coins, voice_minutes, warnings)
-                VALUES (?, ?, 0, 0, 0)
+                INSERT OR IGNORE INTO users (guild_id, user_id, coins, voice_minutes, warnings, defense_tickets)
+                VALUES (?, ?, 0, 0, 0, 0)
                 """,
                 (guild_id, user_id),
             )
@@ -258,7 +261,7 @@ async def on_voice_state_update(member, before, after):
 
 # 3. 슬래시 명령어 그룹 (일반 명령어)
 @bot.tree.command(
-    name="정보", description="본인 또는 선택한 사용자의 코인, 음성 접속 시간, 경고 횟수를 확인합니다."
+    name="정보", description="본인 또는 선택한 사용자의 코인, 음성 접속 시간, 경고 횟수, 방어권을 확인합니다."
 )
 @app_commands.describe(member="조회할 사용자 (선택하지 않으면 본인)")
 async def my_info(
@@ -271,7 +274,7 @@ async def my_info(
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT coins, voice_minutes, warnings FROM users WHERE guild_id = ? AND user_id = ?",
+        "SELECT coins, voice_minutes, warnings, defense_tickets FROM users WHERE guild_id = ? AND user_id = ?",
         (guild_id, user_id),
     )
     row = cursor.fetchone()
@@ -280,12 +283,14 @@ async def my_info(
     coins = row[0] if row else 0
     minutes = row[1] if row else 0
     warnings = row[2] if row else 0
+    defense_tickets = row[3] if row else 0
 
     await interaction.response.send_message(
         f"**{target.name}**님의 서버 활동 정보:\n"
         f"- 🪙 대깨 코인: **{coins}개**\n"
         f"- ⌛ 음성 접속 시간: **{minutes}분**\n"
-        f"- ⚠️ 경고 횟수: **{warnings}회** (3회 누적 시 차단)",
+        f"- ⚠️ 경고 횟수: **{warnings}회** (3회 누적 시 차단)\n"
+        f"- 🛡️️ 경고 방어권: **{defense_tickets}개**",
         ephemeral=True,
     )
 
@@ -393,8 +398,8 @@ async def admin_coin(
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT INTO users (guild_id, user_id, coins, voice_minutes, warnings)
-        VALUES (?, ?, ?, 0, 0)
+        INSERT INTO users (guild_id, user_id, coins, voice_minutes, warnings, defense_tickets)
+        VALUES (?, ?, ?, 0, 0, 0)
         ON CONFLICT(guild_id, user_id) DO UPDATE SET coins = coins + ?
     """,
         (guild_id, target_id, amount, amount),
@@ -435,7 +440,7 @@ async def admin_coin(
 
 @bot.tree.command(
     name="경고지급",
-    description="[관리자 전용] 특정 유저의 경고 횟수를 부여하거나 차감합니다. (음수 입력 시 차감)",
+    description="[관리자 전용] 특정 유저의 경고 횟수를 부여하거나 차감합니다. (음수 입력 시 차감 및 방어권 전환)",
 )
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(
@@ -459,39 +464,73 @@ async def give_warning(
     # 먼저 유저 레코드가 없으면 생성
     cursor.execute(
         """
-        INSERT INTO users (guild_id, user_id, coins, voice_minutes, warnings)
-        VALUES (?, ?, 0, 0, 0)
+        INSERT INTO users (guild_id, user_id, coins, voice_minutes, warnings, defense_tickets)
+        VALUES (?, ?, 0, 0, 0, 0)
         ON CONFLICT(guild_id, user_id) DO NOTHING
         """,
         (guild_id, target_id),
     )
 
-    # 경고 횟수 업데이트 (최종 경고가 0 미만으로 내려가지 않도록 MAX(0, ... 처리))
+    # 현재 경고 및 방어권 조회
     cursor.execute(
-        """
-        UPDATE users 
-        SET warnings = MAX(0, warnings + ?)
-        WHERE guild_id = ? AND user_id = ?
-        """,
-        (count, guild_id, target_id)
-    )
-
-    cursor.execute(
-        "SELECT warnings FROM users WHERE guild_id = ? AND user_id = ?",
+        "SELECT warnings, defense_tickets FROM users WHERE guild_id = ? AND user_id = ?",
         (guild_id, target_id),
     )
-    total_warnings = cursor.fetchone()[0]
-    conn.commit()
-    conn.close()
+    row = cursor.fetchone()
+    current_warnings = row[0]
+    current_defense = row[1]
 
     if count > 0:
+        # 경고 부여 로직
+        new_warnings = current_warnings + count
+        new_defense = current_defense
+        cursor.execute(
+            """
+            UPDATE users 
+            SET warnings = ?
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (new_warnings, guild_id, target_id)
+        )
         action_desc = f"경고 **{count}회**가 부여되었습니다."
         log_text = f"{interaction.user}님이 {member}님에게 경고 {count}회를 부여함"
     else:
-        action_desc = f"경고 **{abs(count)}회**가 차감되었습니다."
-        log_text = f"{interaction.user}님이 {member}님의 경고 {abs(count)}회를 차감함"
+        # 경고 차감 및 방어권 전환 로직 (음수이므로 절대값 활용)
+        deduct_amount = abs(count)
+        if current_warnings >= deduct_amount:
+            # 현재 경고 내에서 전액 차감 가능한 경우
+            new_warnings = current_warnings - deduct_amount
+            new_defense = current_defense
+            action_desc = f"경고 **{deduct_amount}회**가 차감되었습니다."
+            log_text = f"{interaction.user}님이 {member}님의 경고 {deduct_amount}회를 차감함"
+        else:
+            # 경고가 부족하여 초과 차감분이 방어권으로 전환되는 경우
+            leftover = deduct_amount - current_warnings
+            new_warnings = 0
+            new_defense = current_defense + leftover
+            action_desc = f"경고가 모두 소진되어, 초과된 **{leftover}회**만큼 **방어권 {leftover개}**로 적립되었습니다."
+            log_text = f"{interaction.user}님이 {member}님의 경고를 차감하고 초과분 {leftover}회를 방어권으로 전환함"
 
-    await log_admin_action(interaction.guild, f"{log_text} (현재 누적: {total_warnings}회)")
+        cursor.execute(
+            """
+            UPDATE users 
+            SET warnings = ?, defense_tickets = ?
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (new_warnings, new_defense, guild_id, target_id)
+        )
+
+    conn.commit()
+    cursor.execute(
+        "SELECT warnings, defense_tickets FROM users WHERE guild_id = ? AND user_id = ?",
+        (guild_id, target_id),
+    )
+    final_row = cursor.fetchone()
+    total_warnings = final_row[0]
+    total_defense = final_row[1]
+    conn.close()
+
+    await log_admin_action(interaction.guild, f"{log_text} (현재 누적 경고: {total_warnings}회, 방어권: {total_defense}개)")
 
     # 경고 3회 이상 누적 시 자동 차단 처리 (양수로 경고가 올라가서 3 이상이 된 경우)
     if count > 0 and total_warnings >= 3:
@@ -507,7 +546,7 @@ async def give_warning(
             )
     else:
         await interaction.followup.send(
-            f"⚠️ {member.mention}님에게 {action_desc} (현재 누적 경고: **{total_warnings}회**)",
+            f"⚠️ {member.mention}님에게 {action_desc} (현재 누적 경고: **{total_warnings}회**, 방어권: **{total_defense}개**)",
             allowed_mentions=discord.AllowedMentions.none()
         )
 
@@ -562,6 +601,8 @@ async def set_referral_reward(interaction: discord.Interaction, amount: int):
         return
 
     conn = get_db()
+    cursor = conn.권
+    # (오타 방지용 기존 연결 수정)
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -807,7 +848,7 @@ async def show_commands(interaction: discord.Interaction):
     embed.add_field(
         name="일반 명령어",
         value=(
-            "`/정보` — 내 코인 잔액, 음성 접속 시간, 경고 횟수를 확인합니다.\n"
+            "`/정보` — 내 코인 잔액, 음성 접속 시간, 경고 횟수, 방어권을 확인합니다.\n"
             "`/추천인 [유저]` — 추천인을 등록합니다. 음성 접속 시간이 30분 이상이어야 합니다.\n"
             "`/코인순위` — 이 서버의 코인 보유량 상위 10명을 확인합니다."
         ),
@@ -817,7 +858,7 @@ async def show_commands(interaction: discord.Interaction):
         name="관리자 명령어",
         value=(
             "`/코인지급 [유저] [수량]` — 코인을 조정합니다. (음수 입력은 차감)\n"
-            "`/경고지급 [유저] [횟수]` — 경고를 부여하거나 차감합니다. (음수 입력 시 차감, 3회 누적 시 자동 차단)\n"
+            "`/경고지급 [유저] [횟수]` — 경고를 부여하거나 차감합니다. (음수 입력 시 차감 및 방어권 전환, 3회 누적 시 자동 차단)\n"
             "`/보상설정 [수량]` — 음성 접속 누적 30분마다 지급할 코인을 설정합니다.\n"
             "`/추천보상설정 [수량]` — 추천인 등록 성공 시 지급할 코인을 설정합니다.\n"
             "`/코인초기화` — 서버 내 모든 유저의 코인을 공개 경고창을 통해 0으로 초기화합니다.\n"

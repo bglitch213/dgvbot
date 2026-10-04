@@ -625,9 +625,9 @@ class SlotMachineView(discord.ui.View):
                         f"배팅액의 3배인 **+{payout:,}코인**을 획득하셨습니다!"
                     )
                 elif multiplier > 0:
-                    result_text = f"✨ **[당첨!]** **+{payout:,}코인**을 획득하셨습니다!"
+                    result_text = f"✨ **[당첨!]** 배팅액의 **{multiplier:g}배**인 **+{payout:,}코인**을 획득하셨습니다!"
                 else:
-                    result_text = "😢 **[꽝]** 아쉽게도 꽝입니다. 다음 기회에 도전해보세요!"
+                    result_text = "😢 **[꽝]** 배팅액의 **0배**입니다. 아쉽게도 꽝입니다. 다음 기회에 도전해보세요!"
 
                 final_view = SlotMachineView(self.author_id, self.bet_amount)
                 await msg.edit(
@@ -735,9 +735,9 @@ async def slot_machine(interaction: discord.Interaction, bet: int):
                     f"배팅액의 3배인 **+{payout:,}코인**을 획득하셨습니다!"
                 )
             elif multiplier > 0:
-                result_text = f"✨ **[당첨!]** **+{payout:,}코인**을 획득하셨습니다!"
+                result_text = f"✨ **[당첨!]** 배팅액의 **{multiplier:g}배**인 **+{payout:,}코인**을 획득하셨습니다!"
             else:
-                result_text = "😢 **[꽝]** 아쉽게도 꽝입니다. 다음 기회에 도전해보세요!"
+                result_text = "😢 **[꽝]** 배팅액의 **0배**입니다. 아쉽게도 꽝입니다. 다음 기회에 도전해보세요!"
 
             view = SlotMachineView(user_id, bet)
             await msg.edit(
@@ -879,6 +879,35 @@ async def set_slot_rtp(
         f"📈 변경 후: **{rate}%**\n"
         f"📝 관리자 로그에도 변경 내역이 기록되었습니다."
     )
+
+
+@bot.tree.command(
+    name="슬롯머신규칙",
+    description="슬롯머신 이용 방법과 배당 규칙을 확인합니다.",
+)
+async def slot_rules(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🎰 슬롯머신 규칙",
+        description="코인을 사용해 슬롯머신을 돌리고 배당을 받을 수 있습니다.",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="💰 배팅",
+        value="• 최소 배팅: **1코인**\n• 최대 배팅: **5,000코인**\n• 보유 코인이 배팅액보다 적으면 이용할 수 없습니다.\n• 보유 코인이 0 이하(음수 포함)라면 이용할 수 없습니다.",
+        inline=False,
+    )
+    embed.add_field(
+        name="🎯 배당",
+        value="🎰 **3배** — 잭팟\n✨ **1.5배** — 당첨\n🪙 **0.5배** — 당첨\n💀 **0배** — 꽝",
+        inline=False,
+    )
+    embed.add_field(
+        name="🔄 재스핀",
+        value="슬롯 결과 메시지의 **다시 돌리기** 버튼으로 같은 금액을 다시 배팅할 수 있습니다.",
+        inline=False,
+    )
+    embed.set_footer(text="슬롯머신은 서버별 코인으로 운영됩니다.")
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(

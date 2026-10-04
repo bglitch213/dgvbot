@@ -3,6 +3,7 @@ import time
 import asyncio
 from threading import Thread
 from datetime import datetime, timezone, timedelta
+import random
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -69,7 +70,8 @@ def init_db():
             guild_id BIGINT PRIMARY KEY,
             voice_reward_rate INTEGER DEFAULT 1,
             referral_reward INTEGER NOT NULL DEFAULT 30,
-            log_channel_id BIGINT DEFAULT NULL
+            log_channel_id BIGINT DEFAULT NULL,
+            slot_rtp INTEGER DEFAULT 85
         )
     """)
     
@@ -280,7 +282,7 @@ async def my_info(
 
     await interaction.response.send_message(
         f"**{target.mention}**님의 서버 활동 정보:\n"
-        f"- 🪙 대깨 코인: **{coins}개**\n"
+        f"- 🪙 대깨 코인: **{coins:,}개**\n"
         f"- ⌛ 음성 접속 시간: **{minutes}분**\n"
         f"- ⚠️ 경고 횟수: **{warnings}회** (3회 누적 시 차단)\n"
         f"- 🛡 방어권: **{defense_tickets}개**",
@@ -366,6 +368,499 @@ async def register_referral(interaction: discord.Interaction, referrer: discord.
 
     await interaction.response.send_message(
         f"✅ 성공적으로 {referrer.mention}님을 추천인으로 등록했습니다! 추천인에게 **{referral_reward}코인**이 지급되었습니다.",
+        ephemeral=True,
+    )
+
+
+# ==========================================
+# 🎰 슬롯머신 미니게임 기능부
+# ==========================================
+SLOT_ICONS = ["🍒", "🍋", "🍊", "🔔", "⭐", "💎", "7️⃣"]
+
+# 슬롯 결과별 실제 지급 배율.
+# bet을 먼저 차감하므로 3.0x는 "배팅액의 3배를 지급"한다는 의미입니다.
+SLOT_OUTCOMES = (
+    ("jackpot", 3.0),
+    ("double", 1.5),
+    ("pair", 0.5),
+    ("lose", 0.0),
+)
+
+# 같은 사용자가 동시에 여러 슬롯 버튼을 눌러 중복 처리하는 것을 방지합니다.
+active_slot_spins = set()
+
+
+def roll_slot_result(rtp_percent: int):
+    """
+    설정된 RTP에 맞춰 결과를 선택합니다.
+
+    RTP는 '배팅액 대비 장기적으로 돌려주는 금액의 비율'입니다.
+    예: RTP 85 -> 장기 기대 지급액이 배팅액의 약 85%.
+    각 당첨 종류는 동일한 비율로 배분하고, 나머지는 꽝으로 처리합니다.
+
+    이 방식은 결과 확률과 지급 배율을 함께 계산하므로 기존 코드처럼
+    '잭팟 확률 + 더블 확률'이 누적되어 RTP가 크게 초과하는 문제가 없습니다.
+    """
+    rtp = max(0, min(150, int(rtp_percent))) / 100.0
+
+    # 세 가지 당첨 결과의 평균 배율 = (3.0 + 1.5 + 0.5) / 3 = 1.666...
+    winning_average_multiplier = sum(multiplier for _, multiplier in SLOT_OUTCOMES[:3]) / 3.0
+    total_win_probability = min(1.0, rtp / winning_average_multiplier)
+
+    # 당첨 결과는 동일한 확률로 선택합니다.
+    if random.random() < total_win_probability:
+        outcome_name, multiplier = random.choice(SLOT_OUTCOMES[:3])
+
+        if outcome_name == "jackpot":
+            icon = random.choice(SLOT_ICONS)
+            result_icons = [icon, icon, icon]
+        elif outcome_name == "double":
+            icon = random.choice(SLOT_ICONS)
+            other = random.choice([i for i in SLOT_ICONS if i != icon])
+            result_icons = [icon, icon, other]
+            random.shuffle(result_icons)
+        else:  # pair
+            icon = random.choice(SLOT_ICONS)
+            other_icons = [i for i in SLOT_ICONS if i != icon]
+            result_icons = [icon, icon, random.choice(other_icons)]
+            random.shuffle(result_icons)
+
+        return result_icons, multiplier
+
+    # 꽝: 3개가 모두 다른 아이콘으로 만들어 당첨 결과와 겹치지 않게 합니다.
+    result_icons = random.sample(SLOT_ICONS, 3)
+    return result_icons, 0.0
+
+
+def get_slot_rtp(guild_id: int) -> int:
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT slot_rtp FROM guild_settings WHERE guild_id = %s",
+            (guild_id,),
+        )
+        row = cursor.fetchone()
+        return int(row[0]) if row and row[0] is not None else 85
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def deduct_slot_bet(guild_id: int, user_id: int, bet_amount: int) -> bool:
+    """
+    SELECT -> UPDATE 방식의 경쟁 조건을 제거하고,
+    '잔액이 충분한 경우에만' 한 번의 UPDATE로 배팅액을 차감합니다.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO users (
+                guild_id, user_id, coins, voice_minutes,
+                warnings, defense_tickets
+            )
+            VALUES (%s, %s, 0, 0, 0, 0)
+            ON CONFLICT (guild_id, user_id) DO NOTHING
+            """,
+            (guild_id, user_id),
+        )
+
+        cursor.execute(
+            """
+            UPDATE users
+            SET coins = coins - %s
+            WHERE guild_id = %s
+              AND user_id = %s
+              AND coins >= %s
+            RETURNING coins
+            """,
+            (bet_amount, guild_id, user_id, bet_amount),
+        )
+        row = cursor.fetchone()
+
+        if row is None:
+            conn.rollback()
+            return False
+
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def add_slot_payout(guild_id: int, user_id: int, payout: int) -> int:
+    """당첨금을 지급하고 최신 잔액을 반환합니다."""
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            UPDATE users
+            SET coins = coins + %s
+            WHERE guild_id = %s AND user_id = %s
+            RETURNING coins
+            """,
+            (payout, guild_id, user_id),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise RuntimeError("슬롯머신 당첨금 지급 대상 사용자를 찾을 수 없습니다.")
+        conn.commit()
+        return int(row[0])
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def get_current_coins(guild_id: int, user_id: int) -> int:
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT coins FROM users WHERE guild_id = %s AND user_id = %s",
+            (guild_id, user_id),
+        )
+        row = cursor.fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        cursor.close()
+        conn.close()
+
+
+class SlotMachineView(discord.ui.View):
+    def __init__(self, author_id: int, bet_amount: int):
+        super().__init__(timeout=30)
+        self.author_id = author_id
+        self.bet_amount = bet_amount
+
+    @discord.ui.button(label="🎰 다시 돌리기", style=discord.ButtonStyle.success)
+    async def spin_again(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "본인이 실행한 슬롯머신만 다시 돌릴 수 있습니다.",
+                ephemeral=True,
+            )
+            return
+
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "슬롯머신은 서버에서만 사용할 수 있습니다.",
+                ephemeral=True,
+            )
+            return
+
+        if self.author_id in active_slot_spins:
+            await interaction.response.send_message(
+                "⏳ 이미 슬롯머신이 돌아가고 있습니다. 잠시만 기다려주세요.",
+                ephemeral=True,
+            )
+            return
+
+        active_slot_spins.add(self.author_id)
+
+        # 버튼을 먼저 비활성화하여 더블 클릭/중복 인터랙션을 방지합니다.
+        button.disabled = True
+
+        try:
+            guild_id = interaction.guild_id
+            user_id = interaction.user.id
+
+            if not deduct_slot_bet(guild_id, user_id, self.bet_amount):
+                await interaction.response.edit_message(
+                    content=(
+                        "❌ 코인이 부족합니다! "
+                        f"(현재 잔액: {get_current_coins(guild_id, user_id):,}코인)"
+                    ),
+                    view=None,
+                )
+                return
+
+            rtp = get_slot_rtp(guild_id)
+
+            await interaction.response.edit_message(
+                content="🎰 **슬롯머신이 돌아가는 중입니다...**\n` 🔄 | 🔄 | 🔄 `",
+                view=None,
+            )
+
+            msg = interaction.message
+            for _ in range(3):
+                await asyncio.sleep(0.4)
+                r1, r2, r3 = (
+                    random.choice(SLOT_ICONS),
+                    random.choice(SLOT_ICONS),
+                    random.choice(SLOT_ICONS),
+                )
+                await msg.edit(
+                    content=(
+                        "🎰 **슬롯머신이 돌아가는 중입니다...**\n"
+                        f"` {r1} | {r2} | {r3} `"
+                    )
+                )
+
+            result_icons, multiplier = roll_slot_result(rtp)
+            payout = int(self.bet_amount * multiplier)
+
+            if payout > 0:
+                final_coins = add_slot_payout(
+                    guild_id, user_id, payout
+                )
+            else:
+                final_coins = get_current_coins(guild_id, user_id)
+
+            if multiplier >= 3.0:
+                result_text = (
+                    "🎉 **[잭팟 당첨! 3배 승리!]** "
+                    f"배팅액의 3배인 **+{payout:,}코인**을 획득하셨습니다!"
+                )
+            elif multiplier > 0:
+                result_text = (
+                    f"✨ **[당첨!]** **+{payout:,}코인**을 획득하셨습니다!"
+                )
+            else:
+                result_text = (
+                    "😢 **[꽝]** 아쉽게도 꽝입니다. 다음 기회에 도전해보세요!"
+                )
+
+            final_view = SlotMachineView(
+                self.author_id,
+                self.bet_amount,
+            )
+            await msg.edit(
+                content=(
+                    "🎰 **[슬롯머신 결과]**\n"
+                    f"` {result_icons[0]} | {result_icons[1]} | {result_icons[2]} `\n\n"
+                    f"{result_text}\n"
+                    f"💰 현재 잔액: **{final_coins:,}코인**\n"
+                    f"📊 설정 RTP: **{rtp}%**"
+                ),
+                view=final_view,
+            )
+
+        except Exception as e:
+            print(f"[슬롯머신 버튼 오류] {e}")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        f"⚠️ 슬롯머신 처리 중 오류가 발생했습니다: {e}",
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.followup.send(
+                        f"⚠️ 슬롯머신 처리 중 오류가 발생했습니다: {e}",
+                        ephemeral=True,
+                    )
+            except Exception as followup_error:
+                print(f"[슬롯머신 오류 메시지 전송 실패] {followup_error}")
+        finally:
+            active_slot_spins.discard(self.author_id)
+
+
+@bot.tree.command(
+    name="슬롯머신",
+    description="코인을 걸고 슬롯머신을 돌립니다. (최대 5000코인, 최대 3배 배율)",
+)
+@app_commands.describe(bet="배팅할 코인 수량 (1 ~ 5000코인)")
+async def slot_machine(interaction: discord.Interaction, bet: int):
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "❌ 슬롯머신은 서버에서만 사용할 수 있습니다.",
+            ephemeral=True,
+        )
+        return
+
+    if bet < 1:
+        await interaction.response.send_message(
+            "❌ 배팅 코인은 최소 1개 이상이어야 합니다.",
+            ephemeral=True,
+        )
+        return
+
+    if bet > 5000:
+        await interaction.response.send_message(
+            "❌ 1회 최대 배팅 금액은 **5,000코인**입니다.",
+            ephemeral=True,
+        )
+        return
+
+    user_id = interaction.user.id
+    guild_id = interaction.guild_id
+
+    if user_id in active_slot_spins:
+        await interaction.response.send_message(
+            "⏳ 이미 슬롯머신이 돌아가고 있습니다. 잠시만 기다려주세요.",
+            ephemeral=True,
+        )
+        return
+
+    active_slot_spins.add(user_id)
+
+    try:
+        # 잔액 확인과 차감을 하나의 원자적 UPDATE로 처리합니다.
+        if not deduct_slot_bet(guild_id, user_id, bet):
+            current_coins = get_current_coins(guild_id, user_id)
+            await interaction.response.send_message(
+                f"❌ 슬롯머신을 이용할 수 없습니다. 현재 잔액이 부족합니다. (현재 잔액: {current_coins:,}코인)",
+                ephemeral=True,
+            )
+            return
+
+        rtp = get_slot_rtp(guild_id)
+
+        await interaction.response.send_message(
+            "🎰 **슬롯머신이 돌아가는 중입니다...**\n` 🔄 | 🔄 | 🔄 `"
+        )
+        msg = await interaction.original_response()
+
+        for _ in range(3):
+            await asyncio.sleep(0.4)
+            r1, r2, r3 = (
+                random.choice(SLOT_ICONS),
+                random.choice(SLOT_ICONS),
+                random.choice(SLOT_ICONS),
+            )
+            await msg.edit(
+                content=(
+                    "🎰 **슬롯머신이 돌아가는 중입니다...**\n"
+                    f"` {r1} | {r2} | {r3} `"
+                )
+            )
+
+        result_icons, multiplier = roll_slot_result(rtp)
+        payout = int(bet * multiplier)
+
+        if payout > 0:
+            final_coins = add_slot_payout(
+                guild_id, user_id, payout
+            )
+        else:
+            final_coins = get_current_coins(guild_id, user_id)
+
+        if multiplier >= 3.0:
+            result_text = (
+                "🎉 **[잭팟 당첨! 3배 승리!]** "
+                f"배팅액의 3배인 **+{payout:,}코인**을 획득하셨습니다!"
+            )
+        elif multiplier > 0:
+            result_text = (
+                f"✨ **[당첨!]** **+{payout:,}코인**을 획득하셨습니다!"
+            )
+        else:
+            result_text = (
+                "😢 **[꽝]** 아쉽게도 꽝입니다. 다음 기회에 도전해보세요!"
+            )
+
+        view = SlotMachineView(user_id, bet)
+        await msg.edit(
+            content=(
+                "🎰 **[슬롯머신 결과]**\n"
+                f"` {result_icons[0]} | {result_icons[1]} | {result_icons[2]} `\n\n"
+                f"{result_text}\n"
+                f"💰 현재 잔액: **{final_coins:,}코인**\n"
+                f"📊 설정 RTP: **{rtp}%**"
+            ),
+            view=view,
+        )
+
+    except Exception as e:
+        print(f"[슬롯머신 명령어 오류] {e}")
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"⚠️ 슬롯머신 처리 중 오류가 발생했습니다: {e}",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    f"⚠️ 슬롯머신 처리 중 오류가 발생했습니다: {e}",
+                    ephemeral=True,
+                )
+        except Exception as followup_error:
+            print(f"[슬롯머신 오류 메시지 전송 실패] {followup_error}")
+    finally:
+        active_slot_spins.discard(user_id)
+
+
+@bot.tree.command(
+    name="슬롯머신설정",
+    description="[관리자 전용] 슬롯머신 환수율(RTP, %)을 조정합니다.",
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    rtp="설정할 환수율 수치 (10~150%, 기본값 85%)"
+)
+async def set_slot_rtp(
+    interaction: discord.Interaction,
+    rtp: int,
+):
+    # default_permissions는 명령어 UI 노출 권한이고,
+    # 실제 실행 권한은 서버 측에서 다시 확인합니다.
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "❌ 서버에서만 사용할 수 있는 명령어입니다.",
+            ephemeral=True,
+        )
+        return
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "❌ 관리자만 사용할 수 있는 명령어입니다.",
+            ephemeral=True,
+        )
+        return
+
+    if rtp < 10 or rtp > 150:
+        await interaction.response.send_message(
+            "❌ 환수율은 **10~150%** 사이의 값으로 설정해주세요.",
+            ephemeral=True,
+        )
+        return
+
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT slot_rtp FROM guild_settings WHERE guild_id = %s",
+            (interaction.guild_id,),
+        )
+        previous_row = cursor.fetchone()
+        previous_rtp = int(previous_row[0]) if previous_row and previous_row[0] is not None else 85
+
+        cursor.execute(
+            """
+            INSERT INTO guild_settings (guild_id, slot_rtp)
+            VALUES (%s, %s)
+            ON CONFLICT (guild_id)
+            DO UPDATE SET slot_rtp = EXCLUDED.slot_rtp
+            """,
+            (interaction.guild_id, rtp),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+    await log_admin_action(
+        interaction.guild,
+        f"{interaction.user}님이 슬롯머신 환수율을 {previous_rtp}% → {rtp}%로 변경함",
+    )
+    await interaction.response.send_message(
+        f"⚙ [관리자 설정 완료] 슬롯머신 환수율이 **{rtp}%**로 변경되었습니다.",
         ephemeral=True,
     )
 
@@ -1049,6 +1544,7 @@ async def show_commands(interaction: discord.Interaction):
         value=(
             "• `/정보 [유저]` — 본인 또는 다른 유저의 코인 잔액, 음성 접속 시간, 경고 횟수, 방어권을 확인합니다.\n"
             "• `/추천인 [유저]` — 나를 초대해준 사람을 추천인으로 등록합니다. (음성 접속 30분 이상 시 가능)\n"
+            "• `/슬롯머신 [배팅액]` — 1~5,000코인을 배팅하여 슬롯머신(최대 3배 배율)을 돌립니다.\n"
             "• `/채팅청소 [유저] [수량]` — 최근 채팅을 수량만큼 삭제합니다. **(일반 유저는 본인 채팅만 삭제 가능)**\n"
             "• `/코인순위` — 이 서버의 코인 보유량 상위 10명을 확인합니다.\n"
             "• `/명령어` — 봇의 전체 명령어 안내를 확인합니다."
@@ -1059,6 +1555,7 @@ async def show_commands(interaction: discord.Interaction):
     embed.add_field(
         name="🛡️ 관리자 전용 명령어",
         value=(
+            "• `/슬롯머신설정 [환수율%]` — 슬롯머신의 환수율(RTP)을 조정합니다.\n"
             "• `/채팅청소 [타유저] [수량]` — **관리자 권한**으로 다른 유저의 채팅을 지정한 수량만큼 강제로 청소할 수 있습니다. (공개 출력)\n"
             "• `/전체청소` — **관리자 권한**으로 현재 채널의 모든 채팅을 확인창을 거쳐 전부 비우고 완료 메시지를 남깁니다.\n"
             "• `/코인지급 [유저] [수량]` — 특정 유저의 코인을 지급하거나 차감합니다. (차감은 마이너스 입력)\n"

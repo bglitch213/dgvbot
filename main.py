@@ -8,7 +8,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from flask import Flask
-import psycopg2  # SQLite 대신 외부 PostgreSQL(Supabase) 사용
+import psycopg2
+from psycopg2.extras import execute_batch  # 대량 쿼리 최적화를 위한 모듈
 
 # 0. 렌더(Render) 24시간 유지용 Flask 웹서버 설정
 app = Flask('')
@@ -75,9 +76,6 @@ def init_db():
         )
     """)
 
-    # 기존 봇 DB로 운영 중인 서버는 CREATE TABLE IF NOT EXISTS만으로
-    # 새로 추가된 slot_rtp 컬럼이 생성되지 않습니다.
-    # 따라서 기존 테이블에도 안전하게 컬럼을 추가합니다.
     cursor.execute("""
         ALTER TABLE guild_settings
         ADD COLUMN IF NOT EXISTS slot_rtp INTEGER DEFAULT 85
@@ -156,76 +154,99 @@ async def on_guild_join(guild: discord.Guild):
     print(f"[{guild.name}] 서버 명령어 동기화 완료: {len(synced)}개")
 
 
+# ==========================================
+# 🚀 최적화된 음성 시간 체크 루프 (2,000명 규모 대응 Bulk Update)
+# ==========================================
 @tasks.loop(minutes=1)
 async def check_voice_time():
     conn = get_db()
     cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT guild_id, user_id, join_time FROM voice_sessions")
+        sessions = cursor.fetchall()
+        if not sessions:
+            return
 
-    cursor.execute("SELECT guild_id, user_id, join_time FROM voice_sessions")
-    sessions = cursor.fetchall()
+        # 서버별 보상 설정 미리 로드
+        cursor.execute("SELECT guild_id, voice_reward_rate FROM guild_settings")
+        reward_rates = {row[0]: row[1] for row in cursor.fetchall()}
 
-    for guild_id, user_id, join_time in sessions:
-        guild = bot.get_guild(guild_id)
-        if not guild:
-            continue
-        member = guild.get_member(user_id)
+        expired_sessions = []
+        valid_sessions = []
 
-        if (
-            member 
-            and member.voice 
-            and member.voice.channel 
-            and not member.bot
-            and not member.voice.self_mute
-            and not member.voice.self_deaf
-        ):
-            cursor.execute(
-                "SELECT voice_reward_rate FROM guild_settings WHERE guild_id = %s",
-                (guild_id,),
-            )
-            setting = cursor.fetchone()
-            reward_rate = setting[0] if setting else 1
+        for guild_id, user_id, join_time in sessions:
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                expired_sessions.append((guild_id, user_id))
+                continue
+            member = guild.get_member(user_id)
 
-            cursor.execute(
-                """
-                INSERT INTO users (guild_id, user_id, coins, voice_minutes, warnings, defense_tickets)
-                VALUES (%s, %s, 0, 0, 0, 0)
-                ON CONFLICT (guild_id, user_id) DO NOTHING
-                """,
-                (guild_id, user_id),
-            )
+            if (
+                member 
+                and member.voice 
+                and member.voice.channel 
+                and not member.bot
+                and not member.voice.self_mute
+                and not member.voice.self_deaf
+            ):
+                valid_sessions.append((guild_id, user_id))
+            else:
+                expired_sessions.append((guild_id, user_id))
+
+        # 1. 퇴장했거나 유효하지 않은 세션 일괄 삭제
+        if expired_sessions:
+            execute_batch(cursor, "DELETE FROM voice_sessions WHERE guild_id = %s AND user_id = %s", expired_sessions)
+
+        if valid_sessions:
+            # 2. 유효한 유저들의 현재 정보 일괄 조회
+            cursor.execute("""
+                SELECT guild_id, user_id, coins, voice_minutes 
+                FROM users 
+                WHERE (guild_id, user_id) IN (%s)
+            """ % ",".join(["(%s, %s)" % (g, u) for g, u in valid_sessions]))
             
-            cursor.execute(
-                "SELECT coins, voice_minutes FROM users WHERE guild_id = %s AND user_id = %s",
-                (guild_id, user_id)
-            )
-            user_row = cursor.fetchone()
-            current_coins = user_row[0]
-            current_minutes = user_row[1]
-            
-            new_minutes = current_minutes + 1
-            
-            added_coins = 0
-            if new_minutes > 0 and new_minutes % VOICE_REWARD_INTERVAL_MINUTES == 0:
-                added_coins = reward_rate
+            user_data_map = {(row[0], row[1]): {"coins": row[2], "voice_minutes": row[3]} for row in cursor.fetchall()}
 
-            cursor.execute(
-                """
-                UPDATE users
-                SET coins = coins + %s,
-                    voice_minutes = %s
-                WHERE guild_id = %s AND user_id = %s
-                """,
-                (added_coins, new_minutes, guild_id, user_id)
-            )
-        else:
-            cursor.execute(
-                "DELETE FROM voice_sessions WHERE guild_id = %s AND user_id = %s",
-                (guild_id, user_id),
-            )
+            missing_users = []
+            update_rows = []
 
-    conn.commit()
-    cursor.close()
-    conn.close()
+            for guild_id, user_id in valid_sessions:
+                reward_rate = reward_rates.get(guild_id, 1)
+                
+                if (guild_id, user_id) not in user_data_map:
+                    missing_users.append((guild_id, user_id, 0, 1, 0, 0))
+                    new_minutes = 1
+                    added_coins = reward_rate if (new_minutes > 0 and new_minutes % VOICE_REWARD_INTERVAL_MINUTES == 0) else 0
+                else:
+                    current_data = user_data_map[(guild_id, user_id)]
+                    new_minutes = current_data["voice_minutes"] + 1
+                    added_coins = reward_rate if (new_minutes > 0 and new_minutes % VOICE_REWARD_INTERVAL_MINUTES == 0) else 0
+                    current_coins = current_data["coins"]
+                    update_rows.append((current_coins + added_coins, new_minutes, guild_id, user_id))
+
+            # 3. 신규 유저 데이터가 있다면 일괄 삽입 (UPSERT)
+            if missing_users:
+                execute_batch(cursor, """
+                    INSERT INTO users (guild_id, user_id, coins, voice_minutes, warnings, defense_tickets)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (guild_id, user_id) DO NOTHING
+                """, missing_users)
+
+            # 4. 기존 유저 데이터 일괄 업데이트 (Bulk Update)
+            if update_rows:
+                execute_batch(cursor, """
+                    UPDATE users
+                    SET coins = %s, voice_minutes = %s
+                    WHERE guild_id = %s AND user_id = %s
+                """, update_rows)
+
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[음성 시간 체크 오류] {e}")
+    finally:
+        cursor.close()
+        conn.close()
 
 
 @bot.event
@@ -385,8 +406,6 @@ async def register_referral(interaction: discord.Interaction, referrer: discord.
 # ==========================================
 SLOT_ICONS = ["🍒", "🍋", "🍊", "🔔", "⭐", "💎", "7️⃣"]
 
-# 슬롯 결과별 실제 지급 배율.
-# bet을 먼저 차감하므로 3.0x는 "배팅액의 3배를 지급"한다는 의미입니다.
 SLOT_OUTCOMES = (
     ("jackpot", 3.0),
     ("double", 1.5),
@@ -394,32 +413,16 @@ SLOT_OUTCOMES = (
     ("lose", 0.0),
 )
 
-# 같은 사용자가 동시에 여러 슬롯 버튼을 눌러 중복 처리하는 것을 방지합니다.
 active_slot_spins = set()
-# 서버 규모가 커져도 동시에 너무 많은 슬롯 DB/Discord 작업이 몰리지 않도록 제한합니다.
-# 2,000명 규모에서 많은 사용자가 동시에 이용해도 요청은 순차적으로 안전하게 처리됩니다.
 SLOT_CONCURRENCY_LIMIT = 50
 slot_semaphore = asyncio.Semaphore(SLOT_CONCURRENCY_LIMIT)
 
 
 def roll_slot_result(rtp_percent: int):
-    """
-    설정된 RTP에 맞춰 결과를 선택합니다.
-
-    RTP는 '배팅액 대비 장기적으로 돌려주는 금액의 비율'입니다.
-    예: RTP 85 -> 장기 기대 지급액이 배팅액의 약 85%.
-    각 당첨 종류는 동일한 비율로 배분하고, 나머지는 꽝으로 처리합니다.
-
-    이 방식은 결과 확률과 지급 배율을 함께 계산하므로 기존 코드처럼
-    '잭팟 확률 + 더블 확률'이 누적되어 RTP가 크게 초과하는 문제가 없습니다.
-    """
     rtp = max(0, min(150, int(rtp_percent))) / 100.0
-
-    # 세 가지 당첨 결과의 평균 배율 = (3.0 + 1.5 + 0.5) / 3 = 1.666...
     winning_average_multiplier = sum(multiplier for _, multiplier in SLOT_OUTCOMES[:3]) / 3.0
     total_win_probability = min(1.0, rtp / winning_average_multiplier)
 
-    # 당첨 결과는 동일한 확률로 선택합니다.
     if random.random() < total_win_probability:
         outcome_name, multiplier = random.choice(SLOT_OUTCOMES[:3])
 
@@ -431,7 +434,7 @@ def roll_slot_result(rtp_percent: int):
             other = random.choice([i for i in SLOT_ICONS if i != icon])
             result_icons = [icon, icon, other]
             random.shuffle(result_icons)
-        else:  # pair
+        else:
             icon = random.choice(SLOT_ICONS)
             other_icons = [i for i in SLOT_ICONS if i != icon]
             result_icons = [icon, icon, random.choice(other_icons)]
@@ -439,7 +442,6 @@ def roll_slot_result(rtp_percent: int):
 
         return result_icons, multiplier
 
-    # 꽝: 3개가 모두 다른 아이콘으로 만들어 당첨 결과와 겹치지 않게 합니다.
     result_icons = random.sample(SLOT_ICONS, 3)
     return result_icons, 0.0
 
@@ -460,10 +462,6 @@ def get_slot_rtp(guild_id: int) -> int:
 
 
 def deduct_slot_bet(guild_id: int, user_id: int, bet_amount: int) -> bool:
-    """
-    SELECT -> UPDATE 방식의 경쟁 조건을 제거하고,
-    '잔액이 충분한 경우에만' 한 번의 UPDATE로 배팅액을 차감합니다.
-    """
     conn = get_db()
     cursor = conn.cursor()
     try:
@@ -507,7 +505,6 @@ def deduct_slot_bet(guild_id: int, user_id: int, bet_amount: int) -> bool:
 
 
 def add_slot_payout(guild_id: int, user_id: int, payout: int) -> int:
-    """당첨금을 지급하고 최신 잔액을 반환합니다."""
     conn = get_db()
     cursor = conn.cursor()
     try:
@@ -589,14 +586,12 @@ class SlotMachineView(discord.ui.View):
             guild_id = interaction.guild_id
             user_id = interaction.user.id
 
-            # 먼저 Discord 인터랙션에 응답하여 3초 제한을 피합니다.
             await interaction.response.edit_message(
                 content="🎰 **슬롯머신이 돌아가는 중입니다...**\n` 🔄 | 🔄 | 🔄 `",
                 view=None,
             )
             msg = interaction.message
 
-            # 2,000명 규모에서 동시에 요청이 몰려도 DB/Discord 작업이 폭주하지 않도록 제한합니다.
             async with slot_semaphore:
                 if not deduct_slot_bet(guild_id, user_id, self.bet_amount):
                     current_coins = get_current_coins(guild_id, user_id)
@@ -700,13 +695,11 @@ async def slot_machine(interaction: discord.Interaction, bet: int):
     active_slot_spins.add(spin_key)
 
     try:
-        # 먼저 응답하여 Discord의 3초 인터랙션 제한을 피합니다.
         await interaction.response.send_message(
             "🎰 **슬롯머신이 돌아가는 중입니다...**\n` 🔄 | 🔄 | 🔄 `"
         )
         msg = await interaction.original_response()
 
-        # 2,000명 규모에서 동시에 요청이 몰려도 DB/Discord 작업이 폭주하지 않도록 제한합니다.
         async with slot_semaphore:
             if not deduct_slot_bet(guild_id, user_id, bet):
                 current_coins = get_current_coins(guild_id, user_id)
@@ -781,7 +774,6 @@ async def set_slot_rtp(
     interaction: discord.Interaction,
     rate: int,
 ):
-    """관리자가 서버별 슬롯머신 RTP를 변경합니다."""
     if interaction.guild_id is None or interaction.guild is None:
         await interaction.response.send_message(
             "❌ 서버에서만 사용할 수 있는 명령어입니다.",
@@ -803,8 +795,6 @@ async def set_slot_rtp(
         )
         return
 
-    # DB 작업과 관리자 로그 전송에 시간이 걸려도 Discord 인터랙션이 만료되지 않도록
-    # 먼저 응답을 예약합니다. 이후 followup.send()는 공개 채팅 메시지로 전송됩니다.
     await interaction.response.defer(ephemeral=False)
 
     conn = None
@@ -815,7 +805,6 @@ async def set_slot_rtp(
         conn = get_db()
         cursor = conn.cursor()
 
-        # 기존 DB에도 슬롯 RTP 컬럼이 반드시 존재하도록 보장합니다.
         cursor.execute("""
             ALTER TABLE guild_settings
             ADD COLUMN IF NOT EXISTS slot_rtp INTEGER DEFAULT 85
@@ -829,7 +818,6 @@ async def set_slot_rtp(
         if previous_row and previous_row[0] is not None:
             previous_rtp = int(previous_row[0])
 
-        # 서버 설정 행이 없어도 새로 생성하고, 이미 있으면 RTP만 갱신합니다.
         cursor.execute(
             """
             INSERT INTO guild_settings (guild_id, slot_rtp)
@@ -847,8 +835,7 @@ async def set_slot_rtp(
         print(f"[슬롯머신 RTP 설정 오류] {type(e).__name__}: {e}")
         try:
             await interaction.response.send_message(
-                "❌ 슬롯머신 환수율 설정 중 데이터베이스 오류가 발생했습니다. "
-                "콘솔 로그의 '[슬롯머신 RTP 설정 오류]' 내용을 확인해주세요.",
+                "❌ 슬롯머신 환수율 설정 중 데이터베이스 오류가 발생했습니다.",
                 ephemeral=True,
             )
         except discord.InteractionResponded:
@@ -863,7 +850,6 @@ async def set_slot_rtp(
         if conn:
             conn.close()
 
-    # RTP 저장이 성공한 뒤 로그 전송이 실패하더라도 설정 성공 메시지는 정상 출력합니다.
     try:
         await log_admin_action(
             interaction.guild,
@@ -935,7 +921,6 @@ async def clear_chat(
         return
 
     is_admin_clearing_others = is_admin and target.id != interaction.user.id
-
     channel = interaction.channel
     deleted_count = 0
     now = datetime.now(timezone.utc)
@@ -1077,7 +1062,7 @@ class ConfirmClearAllView(discord.ui.View):
 async def clear_all_chat(interaction: discord.Interaction):
     view = ConfirmClearAllView(interaction.user.id)
     await interaction.response.send_message(
-        f"⚠️ **{interaction.user.mention}님이 현재 채널의 전체 채팅 삭제를 요청했습니다!**\n정말로 이 채널의 모든 메시지를 전부 삭제하시겠습니까? (이 작업은 되돌릴 수 없습니다)",
+        f"⚠️ **{interaction.user.mention}님이 현재 채널의 전체 채팅 삭제를 요청했습니다!**\n정말로 이 채널의 모든 메시지를 전부 삭제하시겠습니까?",
         view=view,
         ephemeral=True
     )
@@ -1120,23 +1105,13 @@ async def admin_coin(
     conn.close()
 
     if amount > 0:
-        action = (
-            f"{interaction.user.mention}님이 {member.mention}님에게 "
-            f"코인 **{amount:,}개**를 지급했습니다."
-        )
+        action = f"{interaction.user.mention}님이 {member.mention}님에게 코인 **{amount:,}개**를 지급했습니다."
     elif amount < 0:
-        action = (
-            f"{interaction.user.mention}님이 {member.mention}님의 코인 "
-            f"**{abs(amount):,}개**를 차감했습니다."
-        )
+        action = f"{interaction.user.mention}님이 {member.mention}님의 코인 **{abs(amount):,}개**를 차감했습니다."
     else:
-        action = (
-            f"{interaction.user.mention}님이 {member.mention}님의 코인을 "
-            "변경하지 않았습니다. (수량: 0개)"
-        )
+        action = f"{interaction.user.mention}님이 {member.mention}님의 코인을 변경하지 않았습니다."
 
-    log_msg = f"{interaction.user}님이 {member}님의 코인을 {amount}만큼 조정함 (현재 잔액: {new_coins:,}코인)"
-    await log_admin_action(interaction.guild, log_msg)
+    await log_admin_action(interaction.guild, f"{interaction.user}님이 {member}님의 코인을 {amount}만큼 조정함 (현재 잔액: {new_coins:,}코인)")
 
     await interaction.followup.send(
         f"⚙️ {action}\n현재 잔액: **{new_coins:,}코인**",
@@ -1150,7 +1125,7 @@ async def admin_coin(
 )
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(
-    member="대상을 선택하세요", count="부여할 횟수 (차감은 마이너스 입력, 예: -1)"
+    member="대상을 선택하세요", count="부여할 횟수 (차감은 마이너스 입력)"
 )
 async def give_warning(
     interaction: discord.Interaction, member: discord.Member, count: int
@@ -1158,7 +1133,7 @@ async def give_warning(
     await interaction.response.defer(thinking=True)
 
     if count == 0:
-        await interaction.followup.send("경고 변동 횟수는 0이 될 수 없습니다. (지급은 양수, 차감은 음수 입력)")
+        await interaction.followup.send("경고 변동 횟수는 0이 될 수 없습니다.")
         return
 
     guild_id = interaction.guild_id
@@ -1187,7 +1162,6 @@ async def give_warning(
     if count > 0:
         applied_warnings_count = 0
         used_defense_count = 0
-        
         temp_warnings = current_warnings
         temp_defense = current_defense
         
@@ -1204,48 +1178,34 @@ async def give_warning(
         
         if used_defense_count > 0 and applied_warnings_count == 0:
             action_desc = f"방어권 **{used_defense_count}개**가 소모되어 경고가 방어되었습니다!"
-            log_text = f"{interaction.user}님이 {member}님에게 경고 {count}회를 부여하려 했으나 방어권 {used_defense_count}개로 방어됨"
+            log_text = f"{interaction.user}님이 {member}님에게 경고 {count}회를 부여하려 했으나 방어권으로 방어됨"
         elif used_defense_count > 0:
-            action_desc = f"방어권 **{used_defense_count}개**가 소모되고, 경고 **{applied_warnings_count}회**가 부여되었습니다."
-            log_text = f"{interaction.user}님이 {member}님에게 방어권 {used_defense_count}개 소모 및 경고 {applied_warnings_count}회 부여함"
+            action_desc = f"방어권 **{used_defense_count}개** 소모 및 경고 **{applied_warnings_count}회**가 부여되었습니다."
+            log_text = f"{interaction.user}님이 {member}님에게 방어권 소모 및 경고 부여함"
         else:
             action_desc = f"경고 **{count}회**가 부여되었습니다."
             log_text = f"{interaction.user}님이 {member}님에게 경고 {count}회를 부여함"
 
         cursor.execute(
-            """
-            UPDATE users 
-            SET warnings = %s, defense_tickets = %s
-            WHERE guild_id = %s AND user_id = %s
-            """,
+            "UPDATE users SET warnings = %s, defense_tickets = %s WHERE guild_id = %s AND user_id = %s",
             (new_warnings, new_defense, guild_id, target_id)
         )
-
     else:
         deduct_amount = abs(count)
-        
         if current_warnings >= deduct_amount:
             new_warnings = current_warnings - deduct_amount
             new_defense = current_defense
             action_desc = f"경고 **{deduct_amount}회**가 차감되었습니다."
-            log_text = f"{interaction.user}님이 {member}님의 경고 {deduct_amount}회를 차감함"
+            log_text = f"{interaction.user}님이 {member}님의 경고를 차감함"
         else:
             leftover = deduct_amount - current_warnings
             new_warnings = 0
             new_defense = current_defense + leftover
-            if current_warnings > 0:
-                action_desc = f"경고 **{current_warnings}회**가 모두 소진되고, 초과된 **{leftover}회**만큼 **방어권 {leftover}개**로 적립되었습니다."
-                log_text = f"{interaction.user}님이 {member}님의 경고를 모두 차감하고 초과분 {leftover}회를 방어권으로 전환함"
-            else:
-                action_desc = f"보유 중인 경고가 없어, 차감 수량만큼 **방어권 {leftover}개**가 충전되었습니다."
-                log_text = f"{interaction.user}님이 {member}님에게 방어권 {leftover}개를 충전함"
+            action_desc = f"경고가 모두 소진되고 초과된 **{leftover}회**만큼 **방어권**으로 적립되었습니다."
+            log_text = f"{interaction.user}님이 {member}님의 경고를 차감하고 방어권으로 전환함"
 
         cursor.execute(
-            """
-            UPDATE users 
-            SET warnings = %s, defense_tickets = %s
-            WHERE guild_id = %s AND user_id = %s
-            """,
+            "UPDATE users SET warnings = %s, defense_tickets = %s WHERE guild_id = %s AND user_id = %s",
             (new_warnings, new_defense, guild_id, target_id)
         )
 
@@ -1260,28 +1220,20 @@ async def give_warning(
     cursor.close()
     conn.close()
 
-    detailed_log_text = f"{log_text} (현재 누적 경고: **{total_warnings}회**, 방어권: **{total_defense}개**)"
-    await log_admin_action(interaction.guild, detailed_log_text)
+    await log_admin_action(interaction.guild, f"{log_text} (현재 경고: {total_warnings}회, 방어권: {total_defense}개)")
 
     if count > 0 and applied_warnings_count > 0 and total_warnings >= 3:
         try:
             await interaction.guild.ban(member, reason=f"경고 3회 누적 자동 차단 (관리자: {interaction.user})")
-            ban_log_msg = f"🚨 {member}님이 경고 3회 누적으로 자동 차단됨 (최종 경고: {total_warnings}회)"
-            await log_admin_action(interaction.guild, ban_log_msg)
-            
+            await log_admin_action(interaction.guild, f"🚨 {member}님이 경고 3회 누적으로 자동 차단됨")
             await interaction.followup.send(
-                f"🚨 **[경고 누적 차단]** {member.mention}님이 경고 3회를 초과(`누적 {total_warnings}회`)하여 **서버에서 자동으로 차단(밴)** 되었습니다!\n"
-                f"⚠️ 대상자 현재 상태 — 경고: **{total_warnings}회**, 방어권: **{total_defense}개**"
+                f"🚨 **[경고 누적 차단]** {member.mention}님이 경고 3회를 초과하여 **서버에서 자동으로 차단(밴)** 되었습니다!"
             )
         except Exception as e:
-            await interaction.followup.send(
-                f"⚠ 경고가 부여되었으나, 봇의 권한 부족으로 차단에 실패했습니다. (권한을 확인해주세요)\n오류: {e}\n"
-                f"⚠️ 대상자 현재 상태 — 경고: **{total_warnings}회**, 방어권: **{total_defense}개**"
-            )
+            await interaction.followup.send(f"⚠ 경고가 부여되었으나 차단 실패: {e}")
     else:
         await interaction.followup.send(
-            f"⚠️ {member.mention}님에게 {action_desc}\n"
-            f"⚠️ 대상자 현재 상태 — 경고: **{total_warnings}회**, 방어권: **{total_defense}개**",
+            f"⚠️ {member.mention}님에게 {action_desc}\n현재 상태 — 경고: **{total_warnings}회**, 방어권: **{total_defense}개**",
             allowed_mentions=discord.AllowedMentions.none()
         )
 
@@ -1294,33 +1246,26 @@ async def give_warning(
 @app_commands.describe(amount="음성 채널을 누적 30분 이용할 때 지급할 코인 수")
 async def set_voice_reward(interaction: discord.Interaction, amount: int):
     await interaction.response.defer(thinking=True)
-    
     if amount < 0:
         await interaction.followup.send("보상 코인은 0 이상으로 설정해야 합니다.")
         return
 
-    guild_id = interaction.guild_id
     conn = get_db()
     cursor = conn.cursor()
-
     cursor.execute(
         """
         INSERT INTO guild_settings (guild_id, voice_reward_rate)
         VALUES (%s, %s)
         ON CONFLICT (guild_id) DO UPDATE SET voice_reward_rate = EXCLUDED.voice_reward_rate
     """,
-        (guild_id, amount),
+        (interaction.guild_id, amount),
     )
-
     conn.commit()
     cursor.close()
     conn.close()
 
     await log_admin_action(interaction.guild, f"{interaction.user}님이 음성 30분당 보상 코인을 {amount}개로 설정함")
-
-    await interaction.followup.send(
-        f"⚙ [관리자 설정 완료] 앞으로 음성 채널 누적 **30분마다 {amount}코인**이 지급됩니다."
-    )
+    await interaction.followup.send(f"⚙ [관리자 설정 완료] 앞으로 음성 채널 누적 **30분마다 {amount}코인**이 지급됩니다.")
 
 
 @bot.tree.command(
@@ -1328,10 +1273,9 @@ async def set_voice_reward(interaction: discord.Interaction, amount: int):
     description="[관리자 전용] 추천인 등록 시 추천인에게 지급되는 코인 수를 설정합니다.",
 )
 @app_commands.default_permissions(administrator=True)
-@app_commands.describe(amount="추천인 등록이 성공할 때 추천인에게 지급할 코인 수 (0 이상)")
+@app_commands.describe(amount="추천인 등록 성공 시 지급할 코인 수")
 async def set_referral_reward(interaction: discord.Interaction, amount: int):
     await interaction.response.defer(thinking=True)
-    
     if amount < 0:
         await interaction.followup.send("추천 보상 코인은 0 이상으로 설정해야 합니다.")
         return
@@ -1351,10 +1295,7 @@ async def set_referral_reward(interaction: discord.Interaction, amount: int):
     conn.close()
 
     await log_admin_action(interaction.guild, f"{interaction.user}님이 추천 보상 코인을 {amount}개로 설정함")
-
-    await interaction.followup.send(
-        f"⚙ [관리자 설정 완료] 추천인 등록 성공 시 추천인에게 **{amount}코인**을 지급합니다."
-    )
+    await interaction.followup.send(f"⚙ [관리자 설정 완료] 추천인 등록 성공 시 추천인에게 **{amount}코인**을 지급합니다.")
 
 
 class ConfirmLogChangeView(discord.ui.View):
@@ -1387,12 +1328,8 @@ class ConfirmLogChangeView(discord.ui.View):
         for child in self.children:
             child.disabled = True
 
-        await log_admin_action(interaction.guild, f"{interaction.user}님이 관리자 로그 채널을 이 채널로 변경함")
-
-        await interaction.response.edit_message(
-            content=f"🛡 [관리자 설정 완료] 이 채널({interaction.channel.mention})이 새로운 관리자 명령어 로그 기록 채널로 변경되었습니다.",
-            view=self
-        )
+        await log_admin_action(interaction.guild, f"{interaction.user}님이 관리자 로그 채널을 변경함")
+        await interaction.response.edit_message(content=f"🛡 관리자 로그 채널이 변경되었습니다.", view=self)
         self.stop()
 
     @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
@@ -1400,14 +1337,9 @@ class ConfirmLogChangeView(discord.ui.View):
         if interaction.user.id != self.author_id:
             await interaction.response.send_message("명령어를 실행한 관리자만 누를 수 있습니다.", ephemeral=True)
             return
-
         for child in self.children:
             child.disabled = True
-
-        await interaction.response.edit_message(
-            content=f"❌ 로그 채널 변경이 취소되었습니다. 기존 로그 채널이 유지됩니다.",
-            view=self
-        )
+        await interaction.response.edit_message(content="❌ 로그 채널 변경이 취소되었습니다.", view=self)
         self.stop()
 
 
@@ -1428,14 +1360,9 @@ async def set_log_channel(interaction: discord.Interaction):
     conn.close()
 
     if row and row[0]:
-        existing_channel_id = row[0]
-        existing_channel = interaction.guild.get_channel(existing_channel_id)
-        existing_channel_mention = existing_channel.mention if existing_channel else f"<#{existing_channel_id}>"
-
         view = ConfirmLogChangeView(interaction.user.id, guild_id, channel_id)
         await interaction.response.send_message(
-            f"⚠️ **이미 이 서버에는 지정된 관리자 로그 채널({existing_channel_mention})이 존재합니다!**\n"
-            f"새로운 채널({interaction.channel.mention})로 로그 채널을 변경하시겠습니까?",
+            f"⚠️ **이미 지정된 로그 채널이 존재합니다.** 새로운 채널로 변경하시겠습니까?",
             view=view
         )
     else:
@@ -1453,9 +1380,7 @@ async def set_log_channel(interaction: discord.Interaction):
         cursor.close()
         conn.close()
 
-        await interaction.response.send_message(
-            f"🛡 [관리자 설정 완료] 이 채널({interaction.channel.mention})이 관리자 명령어 로그 기록 채널로 설정되었습니다."
-        )
+        await interaction.response.send_message(f"🛡 [관리자 설정 완료] 이 채널이 관리자 로그 채널로 설정되었습니다.")
         await log_admin_action(interaction.guild, f"{interaction.user}님이 이 채널을 관리자 로그 채널로 지정함")
 
 
@@ -1470,10 +1395,9 @@ class ConfirmResetView(discord.ui.View):
             await interaction.response.send_message("명령어를 실행한 관리자만 누를 수 있습니다.", ephemeral=True)
             return
 
-        guild_id = interaction.guild_id
         conn = get_db()
         cursor = conn.cursor()
-        cursor.execute("UPDATE users SET coins = 0 WHERE guild_id = %s", (guild_id,))
+        cursor.execute("UPDATE users SET coins = 0 WHERE guild_id = %s", (interaction.guild_id,))
         conn.commit()
         cursor.close()
         conn.close()
@@ -1481,12 +1405,8 @@ class ConfirmResetView(discord.ui.View):
         for child in self.children:
             child.disabled = True
 
-        await log_admin_action(interaction.guild, f"{interaction.user}님이 서버 내 모든 유저의 코인 전체 초기화를 최종 승인 및 실행함")
-
-        await interaction.response.edit_message(
-            content=f"⚠️ **[관리자 초기화 완료]** {interaction.user.mention}님이 이 서버의 모든 유저 코인을 **0개**로 초기화했습니다.",
-            view=self
-        )
+        await log_admin_action(interaction.guild, f"{interaction.user}님이 서버 내 모든 유저의 코인 전체 초기화를 실행함")
+        await interaction.response.edit_message(content=f"⚠️ **[관리자 초기화 완료]** 모든 유저 코인이 0으로 초기화되었습니다.", view=self)
         self.stop()
 
     @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
@@ -1494,16 +1414,9 @@ class ConfirmResetView(discord.ui.View):
         if interaction.user.id != self.author_id:
             await interaction.response.send_message("명령어를 실행한 관리자만 누를 수 있습니다.", ephemeral=True)
             return
-
         for child in self.children:
             child.disabled = True
-
-        await log_admin_action(interaction.guild, f"{interaction.user}님이 코인 전체 초기화 요청을 취소함")
-
-        await interaction.response.edit_message(
-            content=f"❌ {interaction.user.mention}님에 의해 코인 초기화가 취소되었습니다.",
-            view=self
-        )
+        await interaction.response.edit_message(content=f"❌ 코인 초기화가 취소되었습니다.", view=self)
         self.stop()
 
 
@@ -1513,11 +1426,10 @@ class ConfirmResetView(discord.ui.View):
 )
 @app_commands.default_permissions(administrator=True)
 async def reset_all_coins(interaction: discord.Interaction):
-    await log_admin_action(interaction.guild, f"{interaction.user}님이 코인 전체 초기화 명령어를 실행(요청)함")
-
+    await log_admin_action(interaction.guild, f"{interaction.user}님이 코인 전체 초기화 명령어를 실행함")
     view = ConfirmResetView(interaction.user.id)
     await interaction.response.send_message(
-        f"⚠️ **{interaction.user.mention}님이 코인 전체 초기화를 요청했습니다!**\n정말로 이 서버의 모든 유저 코인을 0으로 초기화하시겠습니까? 이 작업은 되돌릴 수 없습니다.",
+        f"⚠️ **{interaction.user.mention}님이 코인 전체 초기화를 요청했습니다!** 정말로 모든 유저의 코인을 0으로 초기화하시겠습니까?",
         view=view
     )
 
@@ -1528,9 +1440,7 @@ async def reset_all_coins(interaction: discord.Interaction):
 async def coin_ranking(interaction: discord.Interaction):
     guild_id = interaction.guild_id
     if guild_id is None:
-        await interaction.response.send_message(
-            "이 명령어는 서버 안에서만 사용할 수 있습니다.", ephemeral=True
-        )
+        await interaction.response.send_message("서버 안에서만 사용할 수 있습니다.", ephemeral=True)
         return
 
     conn = get_db()
@@ -1559,7 +1469,7 @@ async def coin_ranking(interaction: discord.Interaction):
             ranking_lines.append(f"{rank_label} <@{user_id}> — **{coins:,}코인**")
         description = "\n".join(ranking_lines)
     else:
-        description = "아직 대깨코인을 보유한 사용자가 없습니다."
+        description = "아직 코인을 보유한 사용자가 없습니다."
 
     embed = discord.Embed(
         title=f"🏆 {interaction.guild.name} 코인 순위",
@@ -1580,50 +1490,45 @@ async def coin_ranking(interaction: discord.Interaction):
 async def show_commands(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🤖 봇 명령어 안내",
-        description="이 서버에서 사용할 수 있는 명령어입니다. 사용자 권한별로 분류되어 있습니다.",
+        description="이 서버에서 사용할 수 있는 명령어입니다.",
         color=discord.Color.blue(),
     )
-    
     embed.add_field(
         name="👤 일반 사용자용 명령어",
         value=(
-            "• `/정보 [유저]` — 본인 또는 다른 유저의 코인 잔액, 음성 접속 시간, 경고 횟수, 방어권을 확인합니다.\n"
-            "• `/추천인 [유저]` — 나를 초대해준 사람을 추천인으로 등록합니다. (음성 접속 30분 이상 시 가능)\n"
-            "• `/슬롯머신 [배팅액]` — 1~5,000코인을 배팅하여 슬롯머신(최대 3배 배율)을 돌립니다.\n"
-            "• `/채팅청소 [유저] [수량]` — 최근 채팅을 수량만큼 삭제합니다. **(일반 유저는 본인 채팅만 삭제 가능)**\n"
-            "• `/코인순위` — 이 서버의 코인 보유량 상위 10명을 확인합니다.\n"
-            "• `/명령어` — 봇의 전체 명령어 안내를 확인합니다."
+            "• `/정보 [유저]` — 코인, 음성 시간, 경고, 방어권 확인\n"
+            "• `/추천인 [유저]` — 추천인 등록 (음성 30분 이상)\n"
+            "• `/슬롯머신 [배팅액]` — 슬롯머신 미니게임\n"
+            "• `/채팅청소 [유저] [수량]` — 본인 채팅 삭제\n"
+            "• `/코인순위` — 코인 상위 10명 확인\n"
+            "• `/명령어` — 명령어 안내"
         ),
         inline=False,
     )
-    
     embed.add_field(
         name="🛡️ 관리자 전용 명령어",
         value=(
-            "• `/슬롯머신설정 [확률]` — 슬롯머신의 환수율(RTP)을 조정합니다.\n"
-            "• `/채팅청소 [타유저] [수량]` — **관리자 권한**으로 다른 유저의 채팅을 지정한 수량만큼 강제로 청소할 수 있습니다. (공개 출력)\n"
-            "• `/전체청소` — **관리자 권한**으로 현재 채널의 모든 채팅을 확인창을 거쳐 전부 비우고 완료 메시지를 남깁니다.\n"
-            "• `/코인지급 [유저] [수량]` — 특정 유저의 코인을 지급하거나 차감합니다. (차감은 마이너스 입력)\n"
-            "• `/경고지급 [유저] [횟수]` — 경고를 부여하거나 차감합니다. (방어권 우선 소모, 음수 입력 시 경고 차감/방어권 충전, 3회 누적 시 자동 밴)\n"
-            "• `/보상설정 [수량]` — 음성 채널 누적 30분 이용 시 지급될 코인 양을 설정합니다.\n"
-            "• `/추천보상설정 [수량]` — 추천인 등록 성공 시 추천인에게 지급할 코인 수를 설정합니다.\n"
-            "• `/코인초기화` — 서버 내 모든 유저의 코인을 공개 경고창을 통해 0으로 초기화합니다.\n"
-            "• `/로그` — 관리자 명령어 실행 기록이 남을 채널을 현재 채널로 설정합니다."
+            "• `/슬롯머신설정 [환수율]` — RTP 조정 (10~150%)\n"
+            "• `/채팅청소 [타유저] [수량]` — 타인 채팅 강제 청소\n"
+            "• `/전체청소` — 현재 채널 전체 채팅 비우기\n"
+            "• `/코인지급 [유저] [수량]` — 코인 지급/차감\n"
+            "• `/경고지급 [유저] [횟수]` — 경고 부여/차감 (방어권 소모, 3회 시 밴)\n"
+            "• `/보상설정 [수량]` — 음성 30분 보상 코인 설정\n"
+            "• `/추천보상설정 [수량]` — 추천 보상 코인 설정\n"
+            "• `/코인초기화` — 전체 코인 0으로 초기화\n"
+            "• `/로그` — 관리자 로그 채널 지정"
         ),
         inline=False,
     )
-
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 if __name__ == "__main__":
     keep_alive()
-    
-    # Render 및 일반 환경에서 사용하는 DISCORD_TOKEN을 우선적으로 안전하게 로드합니다.
     token = os.getenv("DISCORD_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")
     
     if not token:
-        print("❌ 에러: DISCORD_TOKEN 환경 변수가 설정되지 않았습니다! Render 대시보드의 Environment 설정을 확인해주세요.")
+        print("❌ 에러: DISCORD_TOKEN 환경 변수가 설정되지 않았습니다!")
         exit(1)
         
     bot.run(token)

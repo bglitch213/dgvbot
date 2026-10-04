@@ -807,11 +807,11 @@ async def slot_machine(interaction: discord.Interaction, bet: int):
 )
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(
-    확률="설정할 환수율 수치 (10~150%, 기본값 85%)"
+    rate="설정할 환수율 수치 (10~150%, 기본값 85%)"
 )
 async def set_slot_rtp(
     interaction: discord.Interaction,
-    확률: int,
+    rate: int,
 ):
     """관리자가 서버별 슬롯머신 RTP를 변경합니다."""
     if interaction.guild_id is None or interaction.guild is None:
@@ -828,7 +828,7 @@ async def set_slot_rtp(
         )
         return
 
-    if 확률 < 10 or 확률 > 150:
+    if rate < 10 or rate > 150:
         await interaction.response.send_message(
             "❌ 환수율은 **10~150%** 사이의 값으로 설정해주세요.",
             ephemeral=True,
@@ -865,7 +865,7 @@ async def set_slot_rtp(
             ON CONFLICT (guild_id)
             DO UPDATE SET slot_rtp = EXCLUDED.slot_rtp
             """,
-            (interaction.guild_id, 확률),
+            (interaction.guild_id, rate),
         )
         conn.commit()
 
@@ -895,14 +895,14 @@ async def set_slot_rtp(
     try:
         await log_admin_action(
             interaction.guild,
-            f"{interaction.user}님이 슬롯머신 환수율을 {previous_rtp}% → {확률}%로 변경함",
+            f"{interaction.user}님이 슬롯머신 환수율을 {previous_rtp}% → {rate}%로 변경함",
         )
     except Exception as e:
         print(f"[슬롯머신 RTP 설정 로그 오류] {type(e).__name__}: {e}")
 
     await interaction.response.send_message(
-        f"⚙️ **[관리자 설정 완료]** 슬롯머신 환수율이 **{확률}%**로 변경되었습니다.\n"
-        f"이전 환수율: **{previous_rtp}%** → 현재 환수율: **{확률}%**",
+        f"⚙️ **[관리자 설정 완료]** 슬롯머신 환수율이 **{rate}%**로 변경되었습니다.\n"
+        f"이전 환수율: **{previous_rtp}%** → 현재 환수율: **{rate}%**",
         ephemeral=True,
     )
 

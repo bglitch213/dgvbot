@@ -869,9 +869,12 @@ async def set_slot_rtp(
         print(f"[슬롯머신 RTP 설정 로그 오류] {type(e).__name__}: {e}")
 
     await interaction.response.send_message(
-        f"⚙️ **[관리자 설정 완료]** 슬롯머신 환수율이 **{rate}%**로 변경되었습니다.\n"
-        f"이전 환수율: **{previous_rtp}%** → 현재 환수율: **{rate}%**",
-        ephemeral=True,
+        f"⚙️ **[슬롯머신 환수율 변경]**\n"
+        f"👤 변경자: {interaction.user.mention}\n"
+        f"📊 변경 전: **{previous_rtp}%**\n"
+        f"📈 변경 후: **{rate}%**\n"
+        f"📝 관리자 로그에도 변경 내역이 기록되었습니다.",
+        ephemeral=False,
     )
 
 

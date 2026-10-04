@@ -893,7 +893,7 @@ async def slot_rules(interaction: discord.Interaction):
     )
     embed.add_field(
         name="💰 배팅",
-        value="• 최소 배팅: **1코인**\n• 최대 배팅: **5,000코인**\n• 보유 코인이 배팅액보다 적으면 이용할 수 없습니다.\n• 보유 코인이 0 이하(음수 포함)라면 이용할 수 없습니다.",
+        value="• 최소 배팅: **1 대깨코인**\n• 최대 배팅: **5,000 대깨코인**\n• 보유 코인이 배팅액보다 적으면 이용할 수 없습니다.\n• 잔액이 0원일경우 이용할 수 없습니다.",
         inline=False,
     )
     embed.add_field(
@@ -906,7 +906,7 @@ async def slot_rules(interaction: discord.Interaction):
         value="슬롯 결과 메시지의 **다시 돌리기** 버튼으로 같은 금액을 다시 배팅할 수 있습니다.",
         inline=False,
     )
-    embed.set_footer(text="슬롯머신은 서버별 코인으로 운영됩니다.")
+    embed.set_footer(text="슬롯머신은  대깨코인으로 운영됩니다.")
     await interaction.response.send_message(embed=embed)
 
 

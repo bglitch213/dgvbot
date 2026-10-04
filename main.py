@@ -803,6 +803,10 @@ async def set_slot_rtp(
         )
         return
 
+    # DB 작업과 관리자 로그 전송에 시간이 걸려도 Discord 인터랙션이 만료되지 않도록
+    # 먼저 응답을 예약합니다. 이후 followup.send()는 공개 채팅 메시지로 전송됩니다.
+    await interaction.response.defer(ephemeral=False)
+
     conn = None
     cursor = None
     previous_rtp = 85
@@ -868,13 +872,12 @@ async def set_slot_rtp(
     except Exception as e:
         print(f"[슬롯머신 RTP 설정 로그 오류] {type(e).__name__}: {e}")
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"⚙️ **[슬롯머신 환수율 변경]**\n"
         f"👤 변경자: {interaction.user.mention}\n"
         f"📊 변경 전: **{previous_rtp}%**\n"
         f"📈 변경 후: **{rate}%**\n"
-        f"📝 관리자 로그에도 변경 내역이 기록되었습니다.",
-        ephemeral=False,
+        f"📝 관리자 로그에도 변경 내역이 기록되었습니다."
     )
 
 

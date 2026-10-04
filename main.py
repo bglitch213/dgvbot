@@ -74,7 +74,15 @@ def init_db():
             slot_rtp INTEGER DEFAULT 85
         )
     """)
-    
+
+    # 기존 봇 DB로 운영 중인 서버는 CREATE TABLE IF NOT EXISTS만으로
+    # 새로 추가된 slot_rtp 컬럼이 생성되지 않습니다.
+    # 따라서 기존 테이블에도 안전하게 컬럼을 추가합니다.
+    cursor.execute("""
+        ALTER TABLE guild_settings
+        ADD COLUMN IF NOT EXISTS slot_rtp INTEGER DEFAULT 85
+    """)
+
     conn.commit()
     cursor.close()
     conn.close()
@@ -799,15 +807,14 @@ async def slot_machine(interaction: discord.Interaction, bet: int):
 )
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(
-    rtp="설정할 환수율 수치 (10~150%, 기본값 85%)"
+    확률="설정할 환수율 수치 (10~150%, 기본값 85%)"
 )
 async def set_slot_rtp(
     interaction: discord.Interaction,
-    rtp: int,
+    확률: int,
 ):
-    # default_permissions는 명령어 UI 노출 권한이고,
-    # 실제 실행 권한은 서버 측에서 다시 확인합니다.
-    if interaction.guild_id is None:
+    """관리자가 서버별 슬롯머신 RTP를 변경합니다."""
+    if interaction.guild_id is None or interaction.guild is None:
         await interaction.response.send_message(
             "❌ 서버에서만 사용할 수 있는 명령어입니다.",
             ephemeral=True,
@@ -821,23 +828,36 @@ async def set_slot_rtp(
         )
         return
 
-    if rtp < 10 or rtp > 150:
+    if 확률 < 10 or 확률 > 150:
         await interaction.response.send_message(
             "❌ 환수율은 **10~150%** 사이의 값으로 설정해주세요.",
             ephemeral=True,
         )
         return
 
-    conn = get_db()
-    cursor = conn.cursor()
+    conn = None
+    cursor = None
+    previous_rtp = 85
+
     try:
+        conn = get_db()
+        cursor = conn.cursor()
+
+        # 기존 DB에도 슬롯 RTP 컬럼이 반드시 존재하도록 보장합니다.
+        cursor.execute("""
+            ALTER TABLE guild_settings
+            ADD COLUMN IF NOT EXISTS slot_rtp INTEGER DEFAULT 85
+        """)
+
         cursor.execute(
             "SELECT slot_rtp FROM guild_settings WHERE guild_id = %s",
             (interaction.guild_id,),
         )
         previous_row = cursor.fetchone()
-        previous_rtp = int(previous_row[0]) if previous_row and previous_row[0] is not None else 85
+        if previous_row and previous_row[0] is not None:
+            previous_rtp = int(previous_row[0])
 
+        # 서버 설정 행이 없어도 새로 생성하고, 이미 있으면 RTP만 갱신합니다.
         cursor.execute(
             """
             INSERT INTO guild_settings (guild_id, slot_rtp)
@@ -845,22 +865,44 @@ async def set_slot_rtp(
             ON CONFLICT (guild_id)
             DO UPDATE SET slot_rtp = EXCLUDED.slot_rtp
             """,
-            (interaction.guild_id, rtp),
+            (interaction.guild_id, 확률),
         )
         conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        cursor.close()
-        conn.close()
 
-    await log_admin_action(
-        interaction.guild,
-        f"{interaction.user}님이 슬롯머신 환수율을 {previous_rtp}% → {rtp}%로 변경함",
-    )
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        print(f"[슬롯머신 RTP 설정 오류] {type(e).__name__}: {e}")
+        try:
+            await interaction.response.send_message(
+                "❌ 슬롯머신 환수율 설정 중 데이터베이스 오류가 발생했습니다. "
+                "콘솔 로그의 '[슬롯머신 RTP 설정 오류]' 내용을 확인해주세요.",
+                ephemeral=True,
+            )
+        except discord.InteractionResponded:
+            await interaction.followup.send(
+                "❌ 슬롯머신 환수율 설정 중 데이터베이스 오류가 발생했습니다.",
+                ephemeral=True,
+            )
+        return
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+    # RTP 저장이 성공한 뒤 로그 전송이 실패하더라도 설정 성공 메시지는 정상 출력합니다.
+    try:
+        await log_admin_action(
+            interaction.guild,
+            f"{interaction.user}님이 슬롯머신 환수율을 {previous_rtp}% → {확률}%로 변경함",
+        )
+    except Exception as e:
+        print(f"[슬롯머신 RTP 설정 로그 오류] {type(e).__name__}: {e}")
+
     await interaction.response.send_message(
-        f"⚙ [관리자 설정 완료] 슬롯머신 환수율이 **{rtp}%**로 변경되었습니다.",
+        f"⚙️ **[관리자 설정 완료]** 슬롯머신 환수율이 **{확률}%**로 변경되었습니다.\n"
+        f"이전 환수율: **{previous_rtp}%** → 현재 환수율: **{확률}%**",
         ephemeral=True,
     )
 
@@ -1555,7 +1597,7 @@ async def show_commands(interaction: discord.Interaction):
     embed.add_field(
         name="🛡️ 관리자 전용 명령어",
         value=(
-            "• `/슬롯머신설정 [환수율%]` — 슬롯머신의 환수율(RTP)을 조정합니다.\n"
+            "• `/슬롯머신설정 [확률]` — 슬롯머신의 환수율(RTP)을 조정합니다.\n"
             "• `/채팅청소 [타유저] [수량]` — **관리자 권한**으로 다른 유저의 채팅을 지정한 수량만큼 강제로 청소할 수 있습니다. (공개 출력)\n"
             "• `/전체청소` — **관리자 권한**으로 현재 채널의 모든 채팅을 확인창을 거쳐 전부 비우고 완료 메시지를 남깁니다.\n"
             "• `/코인지급 [유저] [수량]` — 특정 유저의 코인을 지급하거나 차감합니다. (차감은 마이너스 입력)\n"

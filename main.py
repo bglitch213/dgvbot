@@ -183,8 +183,7 @@ async def on_ready():
                         INSERT INTO voice_sessions
                             (guild_id, user_id, join_time, counting_since, accumulated_seconds)
                         VALUES (%s, %s, %s, %s, 0)
-                        ON CONFLICT (guild_id, user_id) DO UPDATE SET
-                            counting_since = EXCLUDED.counting_since
+                        ON CONFLICT (guild_id, user_id) DO NOTHING
                         """,
                         (guild.id, member.id, now, None if is_muted else now),
                     )
@@ -242,6 +241,16 @@ async def check_voice_time():
         reward_rates = {row[0]: row[1] for row in cursor.fetchall()}
 
         for guild_id, user_id, join_time, counting_since, accumulated_seconds in sessions:
+            # voice_sessions에 존재하는 모든 음성 이용자는 users에도 반드시 존재하도록 보장합니다.
+            cursor.execute(
+                """
+                INSERT INTO users (guild_id, user_id, coins, voice_minutes, warnings, defense_tickets)
+                VALUES (%s, %s, 0, 0, 0, 0)
+                ON CONFLICT (guild_id, user_id) DO NOTHING
+                """,
+                (guild_id, user_id),
+            )
+
             guild = bot.get_guild(guild_id)
             member = guild.get_member(user_id) if guild else None
 

@@ -764,7 +764,7 @@ async def my_info(
     await interaction.response.send_message(
         f"**{target.mention}**님의 서버 활동 정보:\n"
         f"- 🪙 대깨 코인: **{coins:,}개**\n"
-        f"- ⌛ 음성 접속 시간: **{minutes}분**\n"
+        f"- ⌛ 음성 접속 시간: **{minutes}분** (음성채팅방을 나간 시간으로 계산)\n"
         f"- ⚠️ 경고 횟수: **{warnings}회** (3회 누적 시 차단)\n"
         f"- 🛡 방어권: **{defense_tickets}개**",
         ephemeral=True,

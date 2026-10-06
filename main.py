@@ -927,7 +927,10 @@ async def coin_ranking(interaction: discord.Interaction):
         conn.close()
 
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    lines = [f"{medals.get(i, f'{i}.')} <@{uid}> — **{c:,}코인**" for i, (uid, c)] if rows else ["아직 코인 보유자가 없습니다."]
+lines = [
+    f"{medals.get(i, f'{i}.')} <@{uid}> — **{c:,}코인**" 
+    for i, (uid, c) in enumerate(rows, start=1)
+] if rows else ["아직 코인 보유자가 없습니다."]
     
     embed = discord.Embed(title=f"🏆 {interaction.guild.name} 코인 순위", description="\n".join(lines), color=discord.Color.gold())
     await interaction.response.send_message(embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())

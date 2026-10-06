@@ -384,7 +384,6 @@ async def clear_user_chat(interaction: discord.Interaction, limit: int = 20, mem
     try:
         messages_to_delete = []
         
-        # 1. 유저를 지정한 경우: 해당 유저의 메시지만 수집
         if member:
             async for message in interaction.channel.history(limit=500):
                 if message.author.id == member.id:
@@ -392,11 +391,9 @@ async def clear_user_chat(interaction: discord.Interaction, limit: int = 20, mem
                     if len(messages_to_delete) >= limit:
                         break
             target_name = f"**{member.display_name}**님의"
-        
-        # 2. 유저를 지정하지 않은 경우: 채널의 최근 메시지 순서대로 수집
         else:
             async for message in interaction.channel.history(limit=limit + 1):
-                if message.id != interaction.id:  # 응답용 상호작용 메시지 제외 방어
+                if message.id != interaction.id:
                     messages_to_delete.append(message)
             target_name = "최근"
 
@@ -927,10 +924,10 @@ async def coin_ranking(interaction: discord.Interaction):
         conn.close()
 
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-lines = [
-    f"{medals.get(i, f'{i}.')} <@{uid}> — **{c:,}코인**" 
-    for i, (uid, c) in enumerate(rows, start=1)
-] if rows else ["아직 코인 보유자가 없습니다."]
+    lines = [
+        f"{medals.get(i, f'{i}.')} <@{uid}> — **{c:,}코인**" 
+        for i, (uid, c) in enumerate(rows, start=1)
+    ] if rows else ["아직 코인 보유자가 없습니다."]
     
     embed = discord.Embed(title=f"🏆 {interaction.guild.name} 코인 순위", description="\n".join(lines), color=discord.Color.gold())
     await interaction.response.send_message(embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())

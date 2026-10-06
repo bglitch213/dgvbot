@@ -165,6 +165,17 @@ async def on_ready():
                 for member in channel.members:
                     if member.bot:
                         continue
+
+                    # 봇 재시작 시 기존 음성 이용자도 users에 먼저 등록합니다.
+                    cursor.execute(
+                        """
+                        INSERT INTO users (guild_id, user_id, coins, voice_minutes, warnings, defense_tickets)
+                        VALUES (%s, %s, 0, 0, 0, 0)
+                        ON CONFLICT (guild_id, user_id) DO NOTHING
+                        """,
+                        (guild.id, member.id),
+                    )
+
                     now = time.time()
                     is_muted = member.voice.self_mute or member.voice.self_deaf
                     cursor.execute(
@@ -402,6 +413,16 @@ async def on_voice_state_update(member, before, after):
                 )
 
         elif not was_connected:
+            # 음성방 이용자는 음성시간이 아직 0분이어도 users에 먼저 등록합니다.
+            cursor.execute(
+                """
+                INSERT INTO users (guild_id, user_id, coins, voice_minutes, warnings, defense_tickets)
+                VALUES (%s, %s, 0, 0, 0, 0)
+                ON CONFLICT (guild_id, user_id) DO NOTHING
+                """,
+                (guild_id, user_id),
+            )
+
             # 입장: 음소거 상태라면 세션은 만들되 측정은 시작하지 않습니다.
             cursor.execute(
                 """

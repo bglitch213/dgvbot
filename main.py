@@ -63,9 +63,14 @@ def init_db():
             guild_id BIGINT,
             user_id BIGINT,
             join_time DOUBLE PRECISION,
+            counting_since DOUBLE PRECISION DEFAULT NULL,
+            accumulated_seconds DOUBLE PRECISION DEFAULT 0,
             PRIMARY KEY (guild_id, user_id)
         )
     """)
+    cursor.execute("ALTER TABLE voice_sessions ADD COLUMN IF NOT EXISTS counting_since DOUBLE PRECISION DEFAULT NULL")
+    cursor.execute("ALTER TABLE voice_sessions ADD COLUMN IF NOT EXISTS accumulated_seconds DOUBLE PRECISION DEFAULT 0")
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS guild_settings (
             guild_id BIGINT PRIMARY KEY,
@@ -160,13 +165,17 @@ async def on_ready():
                 for member in channel.members:
                     if member.bot:
                         continue
+                    now = time.time()
+                    is_muted = member.voice.self_mute or member.voice.self_deaf
                     cursor.execute(
                         """
-                        INSERT INTO voice_sessions (guild_id, user_id, join_time)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (guild_id, user_id) DO NOTHING
+                        INSERT INTO voice_sessions
+                            (guild_id, user_id, join_time, counting_since, accumulated_seconds)
+                        VALUES (%s, %s, %s, %s, 0)
+                        ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                            counting_since = EXCLUDED.counting_since
                         """,
-                        (guild.id, member.id, time.time()),
+                        (guild.id, member.id, now, None if is_muted else now),
                     )
         conn.commit()
     except Exception as e:
@@ -197,13 +206,23 @@ async def on_guild_join(guild: discord.Guild):
 # ==========================================
 @tasks.loop(minutes=1)
 async def check_voice_time():
-    """현재 음성 세션 중 정상 상태인 사용자만 1분 단위로 기록합니다.
-    self_mute/self_deaf 상태에서는 세션을 삭제하지 않고 시간만 정지합니다.
+    """음성채널의 실제 활성(비음소거) 시간을 누적합니다.
+
+    - self_mute 또는 self_deaf 상태에서는 측정하지 않습니다.
+    - 음소거는 세션 삭제가 아니라 측정 일시정지입니다.
+    - 1분 루프 실행 횟수가 아니라 실제 경과시간을 기준으로 계산합니다.
+    - 짧은 음성 구간의 초 단위 잔여시간도 세션에 보존합니다.
     """
     conn = get_db()
     cursor = conn.cursor()
+    now = time.time()
     try:
-        cursor.execute("SELECT guild_id, user_id, join_time FROM voice_sessions")
+        cursor.execute("""
+            SELECT guild_id, user_id, join_time, counting_since,
+                   COALESCE(accumulated_seconds, 0)
+            FROM voice_sessions
+            FOR UPDATE
+        """)
         sessions = cursor.fetchall()
         if not sessions:
             return
@@ -211,98 +230,103 @@ async def check_voice_time():
         cursor.execute("SELECT guild_id, voice_reward_rate FROM guild_settings")
         reward_rates = {row[0]: row[1] for row in cursor.fetchall()}
 
-        expired_sessions = []
-        valid_sessions = []
-
-        for guild_id, user_id, join_time in sessions:
+        for guild_id, user_id, join_time, counting_since, accumulated_seconds in sessions:
             guild = bot.get_guild(guild_id)
-            if not guild:
-                expired_sessions.append((guild_id, user_id))
-                continue
+            member = guild.get_member(user_id) if guild else None
 
-            member = guild.get_member(user_id)
             if not member:
                 try:
-                    member = await guild.fetch_member(user_id)
+                    if guild:
+                        member = await guild.fetch_member(user_id)
                 except Exception:
                     member = None
 
-            # 음성방을 나간 경우에만 세션을 종료합니다.
-            # 음소거/헤드셋 음소거는 세션을 유지하되 시간 측정은 하지 않습니다.
+            # 세션이 더 이상 유효하지 않으면 마지막 활성 구간을 먼저 정산하고 삭제합니다.
             if not member or member.bot or not member.voice or not member.voice.channel:
-                expired_sessions.append((guild_id, user_id))
-            elif not member.voice.self_mute and not member.voice.self_deaf:
-                valid_sessions.append((guild_id, user_id))
+                if counting_since is not None:
+                    accumulated_seconds += max(0, now - counting_since)
+                minutes_to_add = int(accumulated_seconds // 60)
+                if minutes_to_add > 0:
+                    cursor.execute(
+                        """
+                        INSERT INTO users (guild_id, user_id, coins, voice_minutes, warnings, defense_tickets)
+                        VALUES (%s, %s, 0, %s, 0, 0)
+                        ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                            voice_minutes = users.voice_minutes + EXCLUDED.voice_minutes
+                        """,
+                        (guild_id, user_id, minutes_to_add),
+                    )
+                    # 위 INSERT/UPDATE만으로는 30분 경계별 보상이 계산되지 않으므로 아래에서 정산합니다.
+                    cursor.execute(
+                        "SELECT voice_minutes, coins FROM users WHERE guild_id = %s AND user_id = %s",
+                        (guild_id, user_id),
+                    )
+                    row = cursor.fetchone()
+                    current_minutes, current_coins = row
+                    # 이미 minutes가 반영된 뒤이므로 경계 보상은 증가분의 구간을 기준으로 계산합니다.
+                    previous_minutes = current_minutes - minutes_to_add
+                    crossed = (current_minutes // VOICE_REWARD_INTERVAL_MINUTES) - (previous_minutes // VOICE_REWARD_INTERVAL_MINUTES)
+                    if crossed > 0:
+                        cursor.execute(
+                            "UPDATE users SET coins = coins + %s WHERE guild_id = %s AND user_id = %s",
+                            (crossed * reward_rates.get(guild_id, 1), guild_id, user_id),
+                        )
+                cursor.execute(
+                    "DELETE FROM voice_sessions WHERE guild_id = %s AND user_id = %s",
+                    (guild_id, user_id),
+                )
+                continue
 
-        if expired_sessions:
-            execute_batch(
-                cursor,
-                "DELETE FROM voice_sessions WHERE guild_id = %s AND user_id = %s",
-                expired_sessions,
-            )
+            muted = member.voice.self_mute or member.voice.self_deaf
 
-        if valid_sessions:
+            if counting_since is None:
+                # 현재 측정 중이 아니면 음소거 해제 상태에서만 새 구간을 시작합니다.
+                if not muted:
+                    cursor.execute(
+                        "UPDATE voice_sessions SET counting_since = %s WHERE guild_id = %s AND user_id = %s",
+                        (now, guild_id, user_id),
+                    )
+                continue
+
+            # 현재까지의 활성 시간을 세션에 반영합니다.
+            accumulated_seconds += max(0, now - counting_since)
+            minutes_to_add = int(accumulated_seconds // 60)
+            remaining_seconds = accumulated_seconds - (minutes_to_add * 60)
+
+            # 음소거 중이면 현재 활성 구간을 여기서 끝내고, 해제될 때 다시 시작합니다.
+            next_counting_since = None if muted else now
+
+            if minutes_to_add > 0:
+                cursor.execute(
+                    "SELECT voice_minutes FROM users WHERE guild_id = %s AND user_id = %s",
+                    (guild_id, user_id),
+                )
+                row = cursor.fetchone()
+                previous_minutes = row[0] if row else 0
+                new_minutes = previous_minutes + minutes_to_add
+                crossed = (new_minutes // VOICE_REWARD_INTERVAL_MINUTES) - (previous_minutes // VOICE_REWARD_INTERVAL_MINUTES)
+                added_coins = crossed * reward_rates.get(guild_id, 1)
+
+                cursor.execute(
+                    """
+                    INSERT INTO users (guild_id, user_id, coins, voice_minutes, warnings, defense_tickets)
+                    VALUES (%s, %s, %s, %s, 0, 0)
+                    ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                        coins = users.coins + EXCLUDED.coins,
+                        voice_minutes = users.voice_minutes + EXCLUDED.voice_minutes
+                    """,
+                    (guild_id, user_id, added_coins, minutes_to_add),
+                )
+
             cursor.execute(
                 """
-                SELECT guild_id, user_id, coins, voice_minutes
-                FROM users
-                WHERE (guild_id, user_id) IN (%s)
-                """ % ",".join(["(%s, %s)" % (g, u) for g, u in valid_sessions])
+                UPDATE voice_sessions
+                SET counting_since = %s,
+                    accumulated_seconds = %s
+                WHERE guild_id = %s AND user_id = %s
+                """,
+                (next_counting_since, remaining_seconds, guild_id, user_id),
             )
-            user_data_map = {
-                (row[0], row[1]): {"coins": row[2], "voice_minutes": row[3]}
-                for row in cursor.fetchall()
-            }
-
-            missing_users = []
-            update_rows = []
-
-            for guild_id, user_id in valid_sessions:
-                reward_rate = reward_rates.get(guild_id, 1)
-
-                if (guild_id, user_id) not in user_data_map:
-                    new_minutes = 1
-                    added_coins = reward_rate if new_minutes % VOICE_REWARD_INTERVAL_MINUTES == 0 else 0
-                    missing_users.append((guild_id, user_id, added_coins, new_minutes, 0, 0))
-                else:
-                    current_data = user_data_map[(guild_id, user_id)]
-                    new_minutes = current_data["voice_minutes"] + 1
-                    added_coins = (
-                        reward_rate
-                        if new_minutes > 0 and new_minutes % VOICE_REWARD_INTERVAL_MINUTES == 0
-                        else 0
-                    )
-                    update_rows.append(
-                        (
-                            current_data["coins"] + added_coins,
-                            new_minutes,
-                            guild_id,
-                            user_id,
-                        )
-                    )
-
-            if missing_users:
-                execute_batch(
-                    cursor,
-                    """
-                    INSERT INTO users
-                        (guild_id, user_id, coins, voice_minutes, warnings, defense_tickets)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (guild_id, user_id) DO NOTHING
-                    """,
-                    missing_users,
-                )
-
-            if update_rows:
-                execute_batch(
-                    cursor,
-                    """
-                    UPDATE users
-                    SET coins = %s, voice_minutes = %s
-                    WHERE guild_id = %s AND user_id = %s
-                    """,
-                    update_rows,
-                )
 
         conn.commit()
     except Exception as e:
@@ -320,59 +344,126 @@ async def on_voice_state_update(member, before, after):
 
     guild_id = member.guild.id
     user_id = member.id
+    now = time.time()
 
-    # 음소거/헤드셋 음소거 변경도 이벤트로 들어오므로
-    # 상태가 바뀔 때마다 세션을 안전하게 갱신합니다.
-    # 중요한 점: 음소거 상태에서는 세션을 삭제하지 않습니다.
     was_connected = before.channel is not None
     is_connected = after.channel is not None
+    muted_after = after.self_mute or after.self_deaf
 
     conn = get_db()
     cursor = conn.cursor()
     try:
+        cursor.execute(
+            """
+            SELECT join_time, counting_since, COALESCE(accumulated_seconds, 0)
+            FROM voice_sessions
+            WHERE guild_id = %s AND user_id = %s
+            FOR UPDATE
+            """,
+            (guild_id, user_id),
+        )
+        row = cursor.fetchone()
+
         if not is_connected:
-            # 음성방 퇴장
-            cursor.execute(
-                "DELETE FROM voice_sessions WHERE guild_id = %s AND user_id = %s",
-                (guild_id, user_id),
-            )
+            # 퇴장: 마지막으로 측정 중이던 구간까지 먼저 정산합니다.
+            if row:
+                join_time, counting_since, accumulated_seconds = row
+                if counting_since is not None:
+                    accumulated_seconds += max(0, now - counting_since)
+                minutes_to_add = int(accumulated_seconds // 60)
+                if minutes_to_add > 0:
+                    cursor.execute(
+                        "SELECT voice_minutes FROM users WHERE guild_id = %s AND user_id = %s",
+                        (guild_id, user_id),
+                    )
+                    user_row = cursor.fetchone()
+                    previous_minutes = user_row[0] if user_row else 0
+                    new_minutes = previous_minutes + minutes_to_add
+                    reward_rate = 1
+                    cursor.execute("SELECT voice_reward_rate FROM guild_settings WHERE guild_id = %s", (guild_id,))
+                    reward_row = cursor.fetchone()
+                    if reward_row:
+                        reward_rate = reward_row[0]
+                    crossed = (new_minutes // VOICE_REWARD_INTERVAL_MINUTES) - (previous_minutes // VOICE_REWARD_INTERVAL_MINUTES)
+                    added_coins = crossed * reward_rate
+                    cursor.execute(
+                        """
+                        INSERT INTO users (guild_id, user_id, coins, voice_minutes, warnings, defense_tickets)
+                        VALUES (%s, %s, %s, %s, 0, 0)
+                        ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                            coins = users.coins + EXCLUDED.coins,
+                            voice_minutes = users.voice_minutes + EXCLUDED.voice_minutes
+                        """,
+                        (guild_id, user_id, added_coins, minutes_to_add),
+                    )
+                cursor.execute(
+                    "DELETE FROM voice_sessions WHERE guild_id = %s AND user_id = %s",
+                    (guild_id, user_id),
+                )
 
         elif not was_connected:
-            # 음성방 입장
+            # 입장: 음소거 상태라면 세션은 만들되 측정은 시작하지 않습니다.
             cursor.execute(
                 """
-                INSERT INTO voice_sessions (guild_id, user_id, join_time)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (guild_id, user_id)
-                DO UPDATE SET join_time = EXCLUDED.join_time
+                INSERT INTO voice_sessions
+                    (guild_id, user_id, join_time, counting_since, accumulated_seconds)
+                VALUES (%s, %s, %s, %s, 0)
+                ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                    join_time = EXCLUDED.join_time,
+                    counting_since = EXCLUDED.counting_since,
+                    accumulated_seconds = 0
                 """,
-                (guild_id, user_id, time.time()),
+                (guild_id, user_id, now, None if muted_after else now),
             )
 
         elif before.channel.id != after.channel.id:
-            # 음성방 이동: 하나의 세션으로 계속 측정
-            # 채널 이동 자체는 시간 측정에 영향을 주지 않습니다.
-            cursor.execute(
-                """
-                INSERT INTO voice_sessions (guild_id, user_id, join_time)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (guild_id, user_id) DO NOTHING
-                """,
-                (guild_id, user_id, time.time()),
-            )
+            # 채널 이동: 음소거 상태가 아니면 기존 활성시간을 끊고 새 구간을 시작합니다.
+            if row:
+                join_time, counting_since, accumulated_seconds = row
+                if counting_since is not None:
+                    accumulated_seconds += max(0, now - counting_since)
+                cursor.execute(
+                    """
+                    UPDATE voice_sessions
+                    SET counting_since = %s, accumulated_seconds = %s
+                    WHERE guild_id = %s AND user_id = %s
+                    """,
+                    (None if muted_after else now, accumulated_seconds, guild_id, user_id),
+                )
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO voice_sessions
+                        (guild_id, user_id, join_time, counting_since, accumulated_seconds)
+                    VALUES (%s, %s, %s, %s, 0)
+                    """,
+                    (guild_id, user_id, now, None if muted_after else now),
+                )
 
         else:
-            # 음소거/헤드셋 음소거 변경 등
-            # 세션을 유지합니다. check_voice_time()이 현재 상태를 확인하여
-            # 정상 상태일 때만 1분을 누적합니다.
-            cursor.execute(
-                """
-                INSERT INTO voice_sessions (guild_id, user_id, join_time)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (guild_id, user_id) DO NOTHING
-                """,
-                (guild_id, user_id, time.time()),
-            )
+            # 음소거/해제 이벤트: 세션은 유지하고 측정 구간만 닫거나 다시 시작합니다.
+            if row:
+                join_time, counting_since, accumulated_seconds = row
+                if counting_since is not None:
+                    accumulated_seconds += max(0, now - counting_since)
+
+                cursor.execute(
+                    """
+                    UPDATE voice_sessions
+                    SET counting_since = %s, accumulated_seconds = %s
+                    WHERE guild_id = %s AND user_id = %s
+                    """,
+                    (None if muted_after else now, accumulated_seconds, guild_id, user_id),
+                )
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO voice_sessions
+                        (guild_id, user_id, join_time, counting_since, accumulated_seconds)
+                    VALUES (%s, %s, %s, %s, 0)
+                    """,
+                    (guild_id, user_id, now, None if muted_after else now),
+                )
 
         conn.commit()
     except Exception as e:
@@ -381,6 +472,7 @@ async def on_voice_state_update(member, before, after):
     finally:
         cursor.close()
         conn.close()
+
 
 @bot.tree.command(
     name="정보", description="본인 또는 선택한 사용자의 코인, 음성 접속 시간, 경고 횟수, 방어권을 확인합니다."

@@ -1280,7 +1280,7 @@ if __name__ == "__main__":
         print("❌ 에러: DISCORD_TOKEN 환경 변수가 설정되지 않았습니다!")
         exit(1)
         
-    bot.run(token)import os
+bot.run(token)import os
 import time
 import asyncio
 from threading import Thread

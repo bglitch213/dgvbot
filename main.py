@@ -94,7 +94,7 @@ def init_db():
 
 init_db()
 
-# 인텐트 설정 강화
+# 인텐트 설정 강화 (Server Members Intent 필수)
 intents = discord.Intents.default()
 intents.guilds = True
 intents.voice_states = True
@@ -155,27 +155,33 @@ async def on_ready():
         except Exception as e:
             print(f"명령어 동기화 중 오류 발생: {e}")
 
-    # 봇 재시작 당시 이미 음성채널에 있던 사용자 세션 동기화 및 복구
+    # 봇 시작 시점 및 실시간 음성채널 전체 강제 동기화 (누락 인원 방지)
     conn = get_db()
     cursor = conn.cursor()
     try:
         for guild in bot.guilds:
+            active_voice_user_ids = set()
             for channel in guild.voice_channels:
                 for member in channel.members:
                     if member.bot:
                         continue
+                    active_voice_user_ids.add(member.id)
+                    username = member.name
 
+                    # 유저 정보 등록 및 username 업데이트
                     cursor.execute(
                         """
                         INSERT INTO users (guild_id, user_id, username, coins, voice_minutes, warnings, defense_tickets)
                         VALUES (%s, %s, %s, 0, 0, 0, 0)
                         ON CONFLICT (guild_id, user_id) DO UPDATE SET username = EXCLUDED.username
                         """,
-                        (guild.id, member.id, member.name),
+                        (guild.id, member.id, username),
                     )
 
                     now = time.time()
                     is_muted = member.voice.self_mute or member.voice.self_deaf
+                    
+                    # voice_sessions에 없으면 새로 생성
                     cursor.execute(
                         """
                         INSERT INTO voice_sessions
@@ -185,6 +191,20 @@ async def on_ready():
                         """,
                         (guild.id, member.id, now, None if is_muted else now),
                     )
+            
+            # 실제로 채널에 없는데 세션에 남아있는 찌투리 데이터 정리
+            cursor.execute(
+                "SELECT user_id FROM voice_sessions WHERE guild_id = %s",
+                (guild.id,)
+            )
+            db_sessions = cursor.fetchall()
+            for (db_uid,) in db_sessions:
+                if db_uid not in active_voice_user_ids:
+                    cursor.execute(
+                        "DELETE FROM voice_sessions WHERE guild_id = %s AND user_id = %s",
+                        (guild.id, db_uid)
+                    )
+
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -210,7 +230,7 @@ async def on_guild_join(guild: discord.Guild):
 
 
 # ==========================================
-# 🚀 최적화된 음성 시간 체크 루프 (예외 방어 적용)
+# 🚀 최적화된 음성 시간 체크 루프 (누락 및 오인식 방지 보완)
 # ==========================================
 @tasks.loop(minutes=1)
 async def check_voice_time():
@@ -230,10 +250,15 @@ async def check_voice_time():
                     try:
                         member = await guild.fetch_member(int(user_id))
                     except Exception:
+                        # 서버에 아예 없거나 나간 유저인 경우 세션 정리
+                        cur.execute("DELETE FROM voice_sessions WHERE guild_id=%s AND user_id=%s", (guild_id, user_id))
+                        conn.commit()
                         continue
 
                 username = member.name
                 voice = member.voice
+                
+                # users 테이블에 username 보장 및 업데이트
                 cur.execute("""
                     INSERT INTO users
                     (guild_id, user_id, username, coins, voice_minutes, warnings, defense_tickets)
@@ -378,7 +403,6 @@ async def on_voice_state_update(member, before, after):
                         (guild_id, user_id, username, added_coins, minutes_to_add),
                     )
                 else:
-                    # 시간이 0분이어도 퇴장 시 닉네임 동기화 보장
                     cursor.execute(
                         """
                         INSERT INTO users (guild_id, user_id, username, coins, voice_minutes, warnings, defense_tickets)

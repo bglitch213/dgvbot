@@ -155,7 +155,7 @@ async def on_ready():
         except Exception as e:
             print(f"명령어 동기화 중 오류 발생: {e}")
 
-    # 봇 시작 시점 및 실시간 음성채널 전체 강제 동기화 (누락 인원 방지)
+    # 봇 시작 시점 음성채널 강제 동기화 및 username 즉시 업데이트
     conn = get_db()
     cursor = conn.cursor()
     try:
@@ -168,7 +168,6 @@ async def on_ready():
                     active_voice_user_ids.add(member.id)
                     username = member.name
 
-                    # 유저 정보 등록 및 username 업데이트
                     cursor.execute(
                         """
                         INSERT INTO users (guild_id, user_id, username, coins, voice_minutes, warnings, defense_tickets)
@@ -181,7 +180,6 @@ async def on_ready():
                     now = time.time()
                     is_muted = member.voice.self_mute or member.voice.self_deaf
                     
-                    # voice_sessions에 없으면 새로 생성
                     cursor.execute(
                         """
                         INSERT INTO voice_sessions
@@ -192,7 +190,6 @@ async def on_ready():
                         (guild.id, member.id, now, None if is_muted else now),
                     )
             
-            # 실제로 채널에 없는데 세션에 남아있는 찌투리 데이터 정리
             cursor.execute(
                 "SELECT user_id FROM voice_sessions WHERE guild_id = %s",
                 (guild.id,)
@@ -230,7 +227,7 @@ async def on_guild_join(guild: discord.Guild):
 
 
 # ==========================================
-# 🚀 최적화된 음성 시간 체크 루프 (누락 및 오인식 방지 보완)
+# 🚀 최적화된 음성 시간 체크 루프 (username 실시간 동기화 포함)
 # ==========================================
 @tasks.loop(minutes=1)
 async def check_voice_time():
@@ -250,7 +247,6 @@ async def check_voice_time():
                     try:
                         member = await guild.fetch_member(int(user_id))
                     except Exception:
-                        # 서버에 아예 없거나 나간 유저인 경우 세션 정리
                         cur.execute("DELETE FROM voice_sessions WHERE guild_id=%s AND user_id=%s", (guild_id, user_id))
                         conn.commit()
                         continue
@@ -258,7 +254,7 @@ async def check_voice_time():
                 username = member.name
                 voice = member.voice
                 
-                # users 테이블에 username 보장 및 업데이트
+                # 1분마다 주기적으로 돌 때도 username이 항상 최신으로 업데이트되도록 설정
                 cur.execute("""
                     INSERT INTO users
                     (guild_id, user_id, username, coins, voice_minutes, warnings, defense_tickets)
@@ -318,6 +314,7 @@ async def check_voice_time():
                 rr = cur.fetchone()
                 rate = rr[0] if rr else 1
                 crossed = new_minutes // VOICE_REWARD_INTERVAL_MINUTES - previous // VOICE_REWARD_INTERVAL_MINUTES
+                
                 cur.execute("""
                     UPDATE users SET voice_minutes=voice_minutes+%s, coins=coins+%s, username=%s
                     WHERE guild_id=%s AND user_id=%s
@@ -370,7 +367,6 @@ async def on_voice_state_update(member, before, after):
         row = cursor.fetchone()
 
         if not is_connected:
-            # 퇴장 시 유저 네임 및 누적 시간 정산 반영
             if row:
                 join_time, counting_since, accumulated_seconds = row
                 if counting_since is not None:
@@ -439,30 +435,16 @@ async def on_voice_state_update(member, before, after):
                 (guild_id, user_id, now, None if muted_after else now),
             )
 
-        elif before.channel.id != after.channel.id:
-            if row:
-                join_time, counting_since, accumulated_seconds = row
-                if counting_since is not None:
-                    accumulated_seconds += max(0, now - counting_since)
-                cursor.execute(
-                    """
-                    UPDATE voice_sessions
-                    SET counting_since = %s, accumulated_seconds = %s
-                    WHERE guild_id = %s AND user_id = %s
-                    """,
-                    (None if muted_after else now, accumulated_seconds, guild_id, user_id),
-                )
-            else:
-                cursor.execute(
-                    """
-                    INSERT INTO voice_sessions
-                        (guild_id, user_id, join_time, counting_since, accumulated_seconds)
-                    VALUES (%s, %s, %s, %s, 0)
-                    """,
-                    (guild_id, user_id, now, None if muted_after else now),
-                )
-
         else:
+            cursor.execute(
+                """
+                INSERT INTO users (guild_id, user_id, username, coins, voice_minutes, warnings, defense_tickets)
+                VALUES (%s, %s, %s, 0, 0, 0, 0)
+                ON CONFLICT (guild_id, user_id) DO UPDATE SET username = EXCLUDED.username
+                """,
+                (guild_id, user_id, username),
+            )
+            
             if row:
                 join_time, counting_since, accumulated_seconds = row
                 if counting_since is not None:
@@ -764,7 +746,7 @@ async def my_info(
     await interaction.response.send_message(
         f"**{target.mention}**님의 서버 활동 정보:\n"
         f"- 🪙 대깨 코인: **{coins:,}개**\n"
-        f"- ⌛ 음성 접속 시간: **{minutes}분** (음성채팅방을 나간 시간으로 계산)\n"
+        f"- ⌛ 음성 접속 시간: **{minutes}분**\n"
         f"- ⚠️ 경고 횟수: **{warnings}회** (3회 누적 시 차단)\n"
         f"- 🛡 방어권: **{defense_tickets}개**",
         ephemeral=True,

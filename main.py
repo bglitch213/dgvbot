@@ -667,3 +667,332 @@ class SlotMachineView(discord.ui.View):
                     current_coins = get_current_coins(guild_id, user_id)
                     await msg.edit(
                         content=(
+                            "❌ 코인이 부족합니다! "
+                            f"(현재 잔액: {current_coins:,}코인)"
+                        ),
+                        view=None,
+                    )
+                    return
+
+                rtp = get_slot_rtp(guild_id)
+                await asyncio.sleep(0.6)
+                result_icons, multiplier = roll_slot_result(rtp)
+                payout = int(self.bet_amount * multiplier)
+
+                if payout > 0:
+                    final_coins = add_slot_payout(guild_id, user_id, payout)
+                else:
+                    final_coins = get_current_coins(guild_id, user_id)
+
+                if multiplier >= 3.0:
+                    result_text = (
+                        "🎉 **[잭팟 당첨! 3배 승리!]** "
+                        f"배팅액의 3배인 **+{payout:,}코인**을 획득하셨습니다!"
+                    )
+                elif multiplier > 0:
+                    result_text = f"✨ **[당첨!]** 배팅액의 **{multiplier:g}배**인 **+{payout:,}코인**을 획득하셨습니다!"
+                else:
+                    result_text = "😢 **[꽝]** 배팅액의 **0배**입니다. 아쉽게도 꽝입니다. 다음 기회에 도전해보세요!"
+
+                final_view = SlotMachineView(self.author_id, self.bet_amount)
+                await msg.edit(
+                    content=(
+                        "🎰 **[슬롯머신 결과]**\n"
+                        f"` {result_icons[0]} | {result_icons[1]} | {result_icons[2]} `\n\n"
+                        f"{result_text}\n"
+                        f"💰 현재 잔액: **{final_coins:,}코인**"
+                    ),
+                    view=final_view,
+                )
+
+        except Exception as e:
+            print(f"[슬롯머신 버튼 오류] {type(e).__name__}: {e}")
+        finally:
+            active_slot_spins.discard(spin_key)
+
+
+@bot.tree.command(
+    name="정보", description="본인 또는 선택한 사용자의 코인, 음성 접속 시간, 경고 횟수, 방어권을 확인합니다."
+)
+@app_commands.describe(member="조회할 사용자 (선택하지 않으면 본인)")
+async def my_info(
+    interaction: discord.Interaction, member: discord.Member = None
+):
+    target = member or interaction.user
+    guild_id = interaction.guild_id
+    user_id = target.id
+
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT coins, voice_minutes, warnings, defense_tickets FROM users WHERE guild_id = %s AND user_id = %s",
+        (guild_id, user_id),
+    )
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    coins = row[0] if row else 0
+    minutes = row[1] if row else 0
+    warnings = row[2] if row else 0
+    defense_tickets = row[3] if row else 0
+
+    await interaction.response.send_message(
+        f"**{target.mention}**님의 서버 활동 정보:\n"
+        f"- 🪙 대깨 코인: **{coins:,}개**\n"
+        f"- ⌛ 음성 접속 시간: **{minutes}분**\n"
+        f"- ⚠️ 경고 횟수: **{warnings}회** (3회 누적 시 차단)\n"
+        f"- 🛡 방어권: **{defense_tickets}개**",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="추천인",
+    description="나를 초대해준 사람을 추천인으로 등록합니다. (누적 음성 30분 이상 시 가능)",
+)
+@app_commands.describe(referrer="추천할 유저를 선택하세요")
+async def register_referral(interaction: discord.Interaction, referrer: discord.Member):
+    if referrer.id == interaction.user.id:
+        await interaction.response.send_message(
+            "자기 자신을 추천인으로 등록할 수 없습니다.", ephemeral=True
+        )
+        return
+    if referrer.bot:
+        await interaction.response.send_message(
+            "봇은 추천인으로 등록할 수 없습니다.", ephemeral=True
+        )
+        return
+
+    guild_id = interaction.guild_id
+    user_id = interaction.user.id
+
+    conn = get_db()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT voice_minutes, referred_by FROM users WHERE guild_id = %s AND user_id = %s",
+        (guild_id, user_id),
+    )
+    row = cursor.fetchone()
+
+    if row and row[1] is not None:
+        cursor.close()
+        conn.close()
+        await interaction.response.send_message(
+            "이미 추천인을 등록하셨습니다.", ephemeral=True
+        )
+        return
+
+    user_minutes = row[0] if row else 0
+    if user_minutes < 30:
+        cursor.close()
+        conn.close()
+        await interaction.response.send_message(
+            f"❌ 음성 접속 시간이 **30분 이상**일 때만 추천인 등록이 가능합니다. (현재: {user_minutes}분)",
+            ephemeral=True,
+        )
+        return
+
+    cursor.execute(
+        "SELECT referral_reward FROM guild_settings WHERE guild_id = %s",
+        (guild_id,),
+    )
+    setting = cursor.fetchone()
+    referral_reward = setting[0] if setting else 30
+
+    cursor.execute(
+        """
+        INSERT INTO users (guild_id, user_id, coins, voice_minutes, referred_by)
+        VALUES (%s, %s, 0, %s, %s)
+        ON CONFLICT (guild_id, user_id) DO UPDATE SET referred_by = EXCLUDED.referred_by
+    """,
+        (guild_id, user_id, user_minutes, referrer.id),
+    )
+
+    cursor.execute(
+        """
+        INSERT INTO users (guild_id, user_id, coins, voice_minutes)
+        VALUES (%s, %s, %s, 0)
+        ON CONFLICT (guild_id, user_id) DO UPDATE SET coins = users.coins + EXCLUDED.coins
+    """,
+        (guild_id, referrer.id, referral_reward),
+    )
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    await interaction.response.send_message(
+        f"✅ 성공적으로 {referrer.mention}님을 추천인으로 등록했습니다! 추천인에게 **{referral_reward}코인**이 지급되었습니다.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="슬롯머신",
+    description="코인을 걸고 슬롯머신을 돌립니다. (최대 500코인, 최대 3배 배율)",
+)
+@app_commands.describe(bet="배팅할 코인 수량 (1 ~ 500코인)")
+async def slot_machine(interaction: discord.Interaction, bet: int):
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "❌ 슬롯머신은 서버에서만 사용할 수 있습니다.",
+            ephemeral=True,
+        )
+        return
+
+    if bet < 1 or bet > 500:
+        await interaction.response.send_message(
+            "❌ 배팅 코인은 **1 ~ 500코인** 사이여야 합니다.",
+            ephemeral=True,
+        )
+        return
+
+    user_id = interaction.user.id
+    guild_id = interaction.guild_id
+    spin_key = (guild_id, user_id)
+
+    if spin_key in active_slot_spins:
+        await interaction.response.send_message(
+            "⏳ 이미 슬롯머신이 돌아가고 있습니다. 잠시만 기다려주세요.",
+            ephemeral=True,
+        )
+        return
+
+    active_slot_spins.add(spin_key)
+
+    try:
+        await interaction.response.send_message(
+            "🎰 **슬롯머신이 돌아가는 중입니다...**\n` 🔄 | 🔄 | 🔄 `"
+        )
+        msg = await interaction.original_response()
+
+        async with slot_semaphore:
+            if not deduct_slot_bet(guild_id, user_id, bet):
+                current_coins = get_current_coins(guild_id, user_id)
+                await msg.edit(
+                    content=(
+                        "❌ 코인이 부족합니다! "
+                        f"(현재 잔액: {current_coins:,}코인)"
+                    ),
+                    view=None,
+                )
+                return
+
+            rtp = get_slot_rtp(guild_id)
+            await asyncio.sleep(0.6)
+            result_icons, multiplier = roll_slot_result(rtp)
+            payout = int(bet * multiplier)
+
+            if payout > 0:
+                final_coins = add_slot_payout(guild_id, user_id, payout)
+            else:
+                final_coins = get_current_coins(guild_id, user_id)
+
+            if multiplier >= 3.0:
+                result_text = f"🎉 **[잭팟 당첨! 3배 승리!]** 배팅액의 3배인 **+{payout:,}코인**을 획득하셨습니다!"
+            elif multiplier > 0:
+                result_text = f"✨ **[당첨!]** 배팅액의 **{multiplier:g}배**인 **+{payout:,}코인**을 획득하셨습니다!"
+            else:
+                result_text = "😢 **[꽝]** 아쉽게도 꽝입니다."
+
+            view = SlotMachineView(user_id, bet)
+            await msg.edit(
+                content=(
+                    "🎰 **[슬롯머신 결과]**\n"
+                    f"` {result_icons[0]} | {result_icons[1]} | {result_icons[2]} `\n\n"
+                    f"{result_text}\n"
+                    f"💰 현재 잔액: **{final_coins:,}코인**"
+                ),
+                view=view,
+            )
+
+    except Exception as e:
+        print(f"[슬롯머신 오류] {e}")
+    finally:
+        active_slot_spins.discard(spin_key)
+
+
+@bot.tree.command(
+    name="코인순위", description="이 서버에서 코인이 많은 상위 10명을 확인합니다."
+)
+async def coin_ranking(interaction: discord.Interaction):
+    guild_id = interaction.guild_id
+    if guild_id is None:
+        await interaction.response.send_message("서버 안에서만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT user_id, coins
+            FROM users
+            WHERE guild_id = %s AND coins > 0
+            ORDER BY coins DESC, user_id ASC
+            LIMIT 10
+            """,
+            (guild_id,),
+        )
+        rows = cursor.fetchall()
+        cursor.close()
+    finally:
+        conn.close()
+
+    if rows:
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        ranking_lines = []
+        for rank, (user_id, coins) in enumerate(rows, start=1):
+            rank_label = medals.get(rank, f"{rank}.")
+            ranking_lines.append(f"{rank_label} <@{user_id}> — **{coins:,}코인**")
+        description = "\n".join(ranking_lines)
+    else:
+        description = "아직 코인을 보유한 사용자가 없습니다."
+
+    embed = discord.Embed(
+        title=f"🏆 {interaction.guild.name} 코인 순위",
+        description=description,
+        color=discord.Color.gold(),
+    )
+    embed.set_footer(text="코인 보유량 상위 10명")
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.tree.command(
+    name="명령어", description="봇이 사용할 수 있는 명령어 목록을 확인합니다."
+)
+async def show_commands(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🤖 봇 명령어 안내",
+        description="이 서버에서 사용할 수 있는 명령어입니다.",
+        color=discord.Color.blue(),
+    )
+    embed.add_field(
+        name="👤 일반 사용자용 명령어",
+        value=(
+            "• `/정보 [유저]` — 코인, 음성 시간, 경고, 방어권 확인\n"
+            "• `/추천인 [유저]` — 추천인 등록 (음성 30분 이상)\n"
+            "• `/슬롯머신 [배팅액]` — 슬롯머신 미니게임 (최대 500코인)\n"
+            "• `/코인순위` — 코인 상위 10명 확인\n"
+            "• `/명령어` — 명령어 안내"
+        ),
+        inline=False,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+if __name__ == "__main__":
+    keep_alive()
+    token = os.getenv("DISCORD_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")
+    
+    if not token:
+        print("❌ 에러: DISCORD_TOKEN 환경 변수가 설정되지 않았습니다!")
+        exit(1)
+        
+    bot.run(token)

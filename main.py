@@ -969,6 +969,81 @@ async def coin_ranking(interaction: discord.Interaction):
         allowed_mentions=discord.AllowedMentions.none(),
     )
 
+@bot.tree.command(name="채팅청소", description="특정 유저가 보낸 메시지를 지정한 수량만큼 삭제합니다. (관리자 전용)")
+@app_commands.describe(member="청소할 대상 유저", limit="삭제할 최대 메시지 수 (1~100)")
+@app_commands.checks.has_permissions(administrator=True)
+async def clear_user_chat(interaction: discord.Interaction, member: discord.Member, limit: int = 10):
+    # 관리자에게만 보이도록 응답 준비 (ephemeral=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    if limit < 1 or limit > 100:
+        await interaction.followup.send("⚠️ 삭제 수량은 1부터 100 사이로 입력해 주세요.", ephemeral=True)
+        return
+
+    deleted_count = 0
+    try:
+        # 채널의 최근 메시지들을 탐색하며 해당 유저의 메시지만 삭제
+        async for message in interaction.channel.history(limit=200):
+            if message.author.id == member.id:
+                try:
+                    await message.delete()
+                    deleted_count += 1
+                    if deleted_count >= limit:
+                        break
+                except discord.HTTPException:
+                    continue  # 삭제 권한 부족 등으로 실패한 메시지는 건너뜀
+
+        await interaction.followup.send(
+            f"🧹 **{member.display_name}**님의 메시지 **{deleted_count}개**를 성공적으로 청소했습니다!", 
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.followup.send(f"❌ 메시지 청소 중 오류가 발생했습니다: {e}", ephemeral=True)
+
+# 관리자가 아닐 때 실행했을 때의 예외 처리
+@clear_user_chat.error
+async def clear_user_chat_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ 이 명령어는 **서버 관리자**만 사용할 수 있습니다.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"❌ 오류 발생: {error}", ephemeral=True)@bot.tree.command(name="채팅청소", description="특정 유저가 보낸 메시지를 지정한 수량만큼 삭제합니다. (관리자 전용)")
+@app_commands.describe(member="청소할 대상 유저", limit="삭제할 최대 메시지 수 (1~100)")
+@app_commands.checks.has_permissions(administrator=True)
+async def clear_user_chat(interaction: discord.Interaction, member: discord.Member, limit: int = 10):
+    # 관리자에게만 보이도록 응답 준비 (ephemeral=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    if limit < 1 or limit > 100:
+        await interaction.followup.send("⚠️ 삭제 수량은 1부터 100 사이로 입력해 주세요.", ephemeral=True)
+        return
+
+    deleted_count = 0
+    try:
+        # 채널의 최근 메시지들을 탐색하며 해당 유저의 메시지만 삭제
+        async for message in interaction.channel.history(limit=200):
+            if message.author.id == member.id:
+                try:
+                    await message.delete()
+                    deleted_count += 1
+                    if deleted_count >= limit:
+                        break
+                except discord.HTTPException:
+                    continue  # 삭제 권한 부족 등으로 실패한 메시지는 건너뜀
+
+        await interaction.followup.send(
+            f"🧹 **{member.display_name}**님의 메시지 **{deleted_count}개**를 성공적으로 청소했습니다!", 
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.followup.send(f"❌ 메시지 청소 중 오류가 발생했습니다: {e}", ephemeral=True)
+
+# 관리자가 아닐 때 실행했을 때의 예외 처리
+@clear_user_chat.error
+async def clear_user_chat_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ 이 명령어는 **서버 관리자**만 사용할 수 있습니다.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"❌ 오류 발생: {error}", ephemeral=True)
 
 @bot.tree.command(
     name="명령어", description="봇이 사용할 수 있는 명령어 목록을 확인합니다."

@@ -472,11 +472,11 @@ async def on_voice_state_update(member, before, after):
 # 5. 🧹 채팅 청소 명령어
 # ==========================================
 @bot.tree.command(name="채팅청소", description="지정한 수량만큼 채팅을 삭제합니다. (선택적으로 특정 유저만 삭제 가능)")
-@app_commands.describe(limit="삭제할 메시지 수 (1~100)", member="청소할 대상 유저 (선택하지 않으면 전체 최근 메시지)")
+@app_commands.describe(limit="삭제할 메시지 수 (1~100, 필수)", member="청소할 대상 유저 (선택, 비우면 전체 최근 메시지)")
 @app_commands.rename(limit="수량", member="유저")
 @app_commands.guild_only()
 @app_commands.checks.has_permissions(administrator=True)
-async def clear_user_chat(interaction: discord.Interaction, limit: int = 20, member: discord.Member = None):
+async def clear_user_chat(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 100], member: discord.Member = None):
     if limit < 1 or limit > 100:
         await interaction.response.send_message("⚠️ 삭제 수량은 1부터 100 사이로 입력해 주세요.", ephemeral=True)
         return

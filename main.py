@@ -95,6 +95,27 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 commands_synced = False
 
+async def sync_application_commands():
+    """
+    슬래시 명령어를 길드별로 즉시 동기화합니다.
+    기존 길드 명령어를 clear()하지 않아 다른 명령어가 실수로 삭제되는 것을 방지합니다.
+    """
+    global commands_synced
+
+    synced_guilds = 0
+    for guild in bot.guilds:
+        try:
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            synced_guilds += 1
+            print(f"[COMMAND SYNC] {guild.name} ({guild.id}) -> {len(synced)}개")
+        except Exception as e:
+            print(f"[COMMAND SYNC ERROR] {guild.name} ({guild.id}): {type(e).__name__}: {e}")
+
+    commands_synced = synced_guilds == len(bot.guilds)
+    return synced_guilds
+
+
 @bot.event
 async def on_ready():
     global commands_synced
@@ -103,31 +124,51 @@ async def on_ready():
     for guild in bot.guilds:
         try:
             await guild.chunk(cache=True)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[MEMBER CHUNK ERROR] {guild.name}: {e}")
 
     if not commands_synced:
-        try:
-            for guild in bot.guilds:
-                bot.tree.clear_commands(guild=guild)
-                bot.tree.copy_global_to(guild=guild)
-                await bot.tree.sync(guild=guild)
-            commands_synced = True
-        except Exception as e:
-            print(f"명령어 동기화 오류: {e}")
+        await sync_application_commands()
 
     if not check_voice_time.is_running():
         check_voice_time.start()
+
+
+@bot.event
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """모든 슬래시 명령어의 권한 및 실행 오류를 중앙에서 처리합니다."""
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "❌ 이 명령어는 **서버 관리자(Administrator)**만 사용할 수 있습니다."
+    elif isinstance(error, app_commands.CheckFailure):
+        message = "❌ 이 명령어를 실행할 권한이 없습니다."
+    elif isinstance(error, app_commands.CommandNotFound):
+        message = "❌ 명령어를 찾을 수 없습니다. 잠시 후 다시 시도해 주세요."
+    else:
+        original = getattr(error, "original", error)
+        print(f"[APP COMMAND ERROR] {type(original).__name__}: {original}")
+        message = f"❌ 명령어 실행 중 오류가 발생했습니다: `{type(original).__name__}`"
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except Exception as send_error:
+        print(f"[APP COMMAND ERROR RESPONSE FAILED] {send_error}")
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
     try:
         await guild.chunk(cache=True)
-    except Exception:
-        pass
-    bot.tree.clear_commands(guild=guild)
-    bot.tree.copy_global_to(guild=guild)
-    await bot.tree.sync(guild=guild)
+    except Exception as e:
+        print(f"[MEMBER CHUNK ERROR] {guild.name}: {e}")
+
+    try:
+        bot.tree.copy_global_to(guild=guild)
+        synced = await bot.tree.sync(guild=guild)
+        print(f"[COMMAND SYNC] 새 서버 {guild.name} ({guild.id}) -> {len(synced)}개")
+    except Exception as e:
+        print(f"[COMMAND SYNC ERROR] 새 서버 {guild.name} ({guild.id}): {type(e).__name__}: {e}")
 
 @tasks.loop(minutes=1)
 async def check_voice_time():
@@ -373,6 +414,7 @@ async def on_voice_state_update(member, before, after):
 # ==========================================
 @bot.tree.command(name="채팅청소", description="지정한 수량만큼 채팅을 순서대로 삭제합니다. (선택적으로 특정 유저만 삭제 가능)")
 @app_commands.describe(limit="삭제할 메시지 수 (1~100)", member="청소할 대상 유저 (선택하지 않으면 전체 최근 메시지)")
+@app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def clear_user_chat(interaction: discord.Interaction, limit: int = 20, member: discord.Member = None):
     await interaction.response.defer(thinking=True, ephemeral=True)
@@ -450,6 +492,7 @@ async def clear_user_chat_error(interaction: discord.Interaction, error: app_com
 # 🔄 닉네임 일괄 동기화 명령어
 # ==========================================
 @bot.tree.command(name="닉네임동기화", description="서버 내 모든 멤버의 닉네임을 DB에 강제로 일괄 동기화합니다.")
+@app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def force_sync_usernames(interaction: discord.Interaction):
     guild = interaction.guild
@@ -484,6 +527,7 @@ async def force_sync_usernames(interaction: discord.Interaction):
 # ==========================================
 @bot.tree.command(name="경고부여", description="특정 유저에게 경고를 1회 부여합니다. (관리자 전용)")
 @app_commands.describe(member="경고를 받을 유저", reason="경고 사유")
+@app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def add_warning(interaction: discord.Interaction, member: discord.Member, reason: str = "사유 없음"):
     if member.bot:
@@ -535,6 +579,7 @@ async def add_warning(interaction: discord.Interaction, member: discord.Member, 
 
 @bot.tree.command(name="경고차감", description="특정 유저의 경고를 1회 차감합니다. (관리자 전용)")
 @app_commands.describe(member="경고를 차감할 유저")
+@app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def remove_warning(interaction: discord.Interaction, member: discord.Member):
     guild_id = interaction.guild_id
@@ -562,6 +607,7 @@ async def remove_warning(interaction: discord.Interaction, member: discord.Membe
 
 @bot.tree.command(name="코인지급", description="특정 유저에게 코인을 지급합니다. (관리자 전용)")
 @app_commands.describe(member="코인을 받을 유저", amount="지급할 코인 수량")
+@app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def give_coins(interaction: discord.Interaction, member: discord.Member, amount: int):
     if amount <= 0:
@@ -589,6 +635,7 @@ async def give_coins(interaction: discord.Interaction, member: discord.Member, a
 
 @bot.tree.command(name="코인회수", description="특정 유저의 코인을 회수합니다. (관리자 전용)")
 @app_commands.describe(member="코인을 회수할 유저", amount="회수할 코인 수량")
+@app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def take_coins(interaction: discord.Interaction, member: discord.Member, amount: int):
     if amount <= 0:
@@ -620,6 +667,7 @@ async def take_coins(interaction: discord.Interaction, member: discord.Member, a
 
 @bot.tree.command(name="방어권지급", description="특정 유저에게 방어권을 지급합니다. (관리자 전용)")
 @app_commands.describe(member="방어권을 받을 유저", amount="지급할 수량")
+@app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def give_defense_ticket(interaction: discord.Interaction, member: discord.Member, amount: int = 1):
     if amount <= 0:

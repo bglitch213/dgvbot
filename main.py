@@ -172,9 +172,11 @@ async def on_guild_join(guild: discord.Guild):
 
 @tasks.loop(minutes=1)
 async def check_voice_time():
-    conn = get_db()
-    cur = conn.cursor()
+    conn = None
+    cur = None
     try:
+        conn = get_db()
+        cur = conn.cursor()
         cur.execute("SELECT guild_id, user_id, join_time, counting_since, accumulated_seconds FROM voice_sessions")
         sessions = cur.fetchall()
 
@@ -273,8 +275,21 @@ async def check_voice_time():
         conn.rollback()
         print(f"[VOICE DEBUG] 전체 음성 체크 오류: {e}")
     finally:
-        cur.close()
-        conn.close()
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.close()
+
+
+@check_voice_time.before_loop
+async def before_check_voice_time():
+    await bot.wait_until_ready()
+
+
+@check_voice_time.error
+async def check_voice_time_error(error):
+    print(f"[VOICE LOOP ERROR] {type(error).__name__}: {error}")
+
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -290,9 +305,11 @@ async def on_voice_state_update(member, before, after):
     is_connected = after.channel is not None
     muted_after = after.self_mute or after.self_deaf
 
-    conn = get_db()
-    cursor = conn.cursor()
+    conn = None
+    cursor = None
     try:
+        conn = get_db()
+        cursor = conn.cursor()
         cursor.execute(
             """
             SELECT join_time, counting_since, COALESCE(accumulated_seconds, 0)
@@ -405,19 +422,32 @@ async def on_voice_state_update(member, before, after):
         conn.rollback()
         print(f"[음성 상태 업데이트 오류] {e}")
     finally:
-        cursor.close()
-        conn.close()
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
 
 
 # ==========================================
 # 🧹 채팅 청소 명령어 (수량 먼저, 멤버는 선택사항)
 # ==========================================
-@bot.tree.command(name="채팅청소", description="지정한 수량만큼 채팅을 순서대로 삭제합니다. (선택적으로 특정 유저만 삭제 가능)")
-@app_commands.describe(limit="삭제할 메시지 수 (1~100)", member="청소할 대상 유저 (선택하지 않으면 전체 최근 메시지)")
+@bot.tree.command(name="채팅청소", description="지정한 수량만큼 최근 메시지를 정확히 삭제합니다. (특정 유저 선택 가능)")
+@app_commands.describe(
+    limit="삭제할 메시지 수 (1~100)",
+    member="청소할 대상 유저 (선택하지 않으면 전체 최근 메시지)"
+)
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
-async def clear_user_chat(interaction: discord.Interaction, limit: int = 20, member: discord.Member = None):
+async def clear_user_chat(
+    interaction: discord.Interaction,
+    limit: int = 20,
+    member: discord.Member = None
+):
     await interaction.response.defer(thinking=True, ephemeral=True)
+
+    if interaction.guild is None or interaction.channel is None:
+        await interaction.followup.send("❌ 서버의 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
+        return
 
     if limit < 1 or limit > 100:
         await interaction.followup.send("⚠️ 삭제 수량은 1부터 100 사이로 입력해 주세요.", ephemeral=True)
@@ -425,19 +455,22 @@ async def clear_user_chat(interaction: discord.Interaction, limit: int = 20, mem
 
     try:
         messages_to_delete = []
-        
-        if member:
+
+        # 기존 limit + 1을 제거했습니다.
+        # 이제 입력한 수량만큼 정확히 가져옵니다.
+        if member is None:
+            async for message in interaction.channel.history(limit=limit):
+                messages_to_delete.append(message)
+            target_name = "최근"
+        else:
+            # 특정 유저 메시지는 최대 500개까지 탐색하지만
+            # 실제 삭제 대상은 입력한 limit개로 정확히 제한합니다.
             async for message in interaction.channel.history(limit=500):
                 if message.author.id == member.id:
                     messages_to_delete.append(message)
                     if len(messages_to_delete) >= limit:
                         break
             target_name = f"**{member.display_name}**님의"
-        else:
-            async for message in interaction.channel.history(limit=limit + 1):
-                if message.id != interaction.id:
-                    messages_to_delete.append(message)
-            target_name = "최근"
 
         if not messages_to_delete:
             await interaction.followup.send("⚠️ 삭제할 대화 내역을 찾지 못했습니다.", ephemeral=True)
@@ -446,42 +479,75 @@ async def clear_user_chat(interaction: discord.Interaction, limit: int = 20, mem
         now = datetime.now(timezone.utc)
         recent_messages = []
         old_messages = []
-        
-        for m in messages_to_delete:
-            if (now - m.created_at).days < 14:
-                recent_messages.append(m)
+
+        for message in messages_to_delete:
+            if (now - message.created_at).total_seconds() < 14 * 24 * 60 * 60:
+                recent_messages.append(message)
             else:
-                old_messages.append(m)
+                old_messages.append(message)
 
         deleted_count = 0
-        if recent_messages:
-            for i in range(0, len(recent_messages), 100):
-                chunk = recent_messages[i:i+100]
-                if len(chunk) > 1:
-                    await interaction.channel.delete_messages(chunk)
-                    deleted_count += len(chunk)
-                else:
-                    await chunk[0].delete()
-                    deleted_count += 1
+        failed_count = 0
 
-        for m in old_messages:
+        # 14일 이내 메시지는 Bulk Delete
+        for i in range(0, len(recent_messages), 100):
+            chunk = recent_messages[i:i + 100]
             try:
-                await m.delete()
-                deleted_count += 1
-                await asyncio.sleep(0.5)
-            except Exception:
-                pass
+                if len(chunk) == 1:
+                    await chunk[0].delete()
+                else:
+                    await interaction.channel.delete_messages(chunk)
+                deleted_count += len(chunk)
+            except discord.HTTPException:
+                # Bulk Delete 실패 시 개별 삭제 재시도
+                for message in chunk:
+                    try:
+                        await message.delete()
+                        deleted_count += 1
+                    except discord.HTTPException:
+                        failed_count += 1
 
+        # 14일 초과 메시지는 개별 삭제
+        for message in old_messages:
+            try:
+                await message.delete()
+                deleted_count += 1
+                await asyncio.sleep(0.35)
+            except discord.HTTPException:
+                failed_count += 1
+
+        result = f"🧹 {target_name} 메시지 **{deleted_count}개**를 삭제했습니다."
+        if failed_count:
+            result += f"\n⚠️ Discord 제한/권한 문제로 **{failed_count}개**는 삭제하지 못했습니다."
+
+        await interaction.followup.send(result, ephemeral=True)
+
+    except discord.Forbidden:
         await interaction.followup.send(
-            f"🧹 {target_name} 메시지 **{deleted_count}개**를 성공적으로 청소했습니다!", 
+            "❌ 봇에게 **메시지 관리(Manage Messages)** 권한이 없습니다.",
+            ephemeral=True
+        )
+    except discord.HTTPException as e:
+        await interaction.followup.send(
+            f"❌ Discord API 오류로 청소에 실패했습니다: `{e}`",
             ephemeral=True
         )
     except Exception as e:
-        await interaction.followup.send(f"❌ 메시지 청소 중 오류가 발생했습니다: {e}", ephemeral=True)
+        print(f"[CHAT CLEAN ERROR] {type(e).__name__}: {e}")
+        await interaction.followup.send(
+            f"❌ 메시지 청소 중 예상하지 못한 오류가 발생했습니다: `{type(e).__name__}`",
+            ephemeral=True
+        )
 
 @clear_user_chat.error
 async def clear_user_chat_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    msg = "❌ 이 명령어는 **서버 관리자**만 사용할 수 있습니다." if isinstance(error, app_commands.MissingPermissions) else f"❌ 오류 발생: {error}"
+    if isinstance(error, app_commands.MissingPermissions):
+        msg = "❌ 이 명령어는 **서버 관리자**만 사용할 수 있습니다."
+    else:
+        original = getattr(error, "original", error)
+        print(f"[CHAT CLEAN COMMAND ERROR] {type(original).__name__}: {original}")
+        msg = f"❌ 청소 명령어 오류: `{type(original).__name__}`"
+
     if not interaction.response.is_done():
         await interaction.response.send_message(msg, ephemeral=True)
     else:
@@ -654,6 +720,7 @@ async def take_coins(interaction: discord.Interaction, member: discord.Member, a
         )
         row = cursor.fetchone()
         if not row:
+            conn.rollback()
             await interaction.response.send_message("❌ 유저 데이터를 찾을 수 없습니다.", ephemeral=True)
             return
         conn.commit()
@@ -902,8 +969,24 @@ async def register_referral(interaction: discord.Interaction, referrer: discord.
     setting = cursor.fetchone()
     reward = setting[0] if setting else 30
 
-    cursor.execute("UPDATE users SET referred_by = %s WHERE guild_id = %s AND user_id = %s", (referrer.id, guild_id, user_id))
-    cursor.execute("INSERT INTO users (guild_id, user_id, coins) VALUES (%s, %s, %s) ON CONFLICT (guild_id, user_id) DO UPDATE SET coins = users.coins + EXCLUDED.coins", (guild_id, referrer.id, reward))
+    cursor.execute(
+        """
+        INSERT INTO users (guild_id, user_id, username, referred_by)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (guild_id, user_id)
+        DO UPDATE SET referred_by = EXCLUDED.referred_by, username = EXCLUDED.username
+        """,
+        (guild_id, user_id, interaction.user.name, referrer.id)
+    )
+    cursor.execute(
+        """
+        INSERT INTO users (guild_id, user_id, username, coins)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (guild_id, user_id)
+        DO UPDATE SET coins = users.coins + EXCLUDED.coins, username = EXCLUDED.username
+        """,
+        (guild_id, referrer.id, referrer.name, reward)
+    )
     conn.commit()
     cursor.close()
     conn.close()

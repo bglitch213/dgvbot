@@ -154,6 +154,7 @@ def init_db():
         cur.execute("ALTER TABLE voice_sessions ADD COLUMN IF NOT EXISTS counting_since DOUBLE PRECISION DEFAULT NULL")
         cur.execute("ALTER TABLE voice_sessions ADD COLUMN IF NOT EXISTS accumulated_seconds DOUBLE PRECISION DEFAULT 0")
         cur.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS slot_rtp INTEGER DEFAULT 85")
+        cur.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS log_channel_id BIGINT DEFAULT NULL")
 
     _run(_init)
 
@@ -540,9 +541,10 @@ async def clear_user_chat(interaction: discord.Interaction, limit: int = 20, mem
             except Exception:
                 pass
 
-        await interaction.followup.send(
+        await finish_admin_command(
+            interaction, "채팅청소",
             f"🧹 {target_name} 메시지 **{deleted_count}개**를 성공적으로 청소했습니다!",
-            ephemeral=True,
+            f"대상: {member.mention if member else '채널 전체 최근 메시지'} / 삭제: {deleted_count}개",
         )
     except Exception as e:
         await interaction.followup.send(f"❌ 메시지 청소 중 오류가 발생했습니다: {e}", ephemeral=True)
@@ -576,7 +578,11 @@ async def force_sync_usernames(interaction: discord.Interaction):
         return
     try:
         await run_db(sync_usernames_db, guild.id, rows)
-        await interaction.followup.send(f"✅ 성공적으로 서버 멤버 {len(rows)}명의 닉네임을 DB에 동기화했습니다!", ephemeral=True)
+        await finish_admin_command(
+            interaction, "닉네임동기화",
+            f"✅ 성공적으로 서버 멤버 {len(rows)}명의 닉네임을 DB에 동기화했습니다!",
+            f"멤버 {len(rows)}명 동기화",
+        )
     except Exception as e:
         await interaction.followup.send(f"❌ 동기화 중 오류 발생: {e}", ephemeral=True)
 
@@ -584,6 +590,137 @@ async def force_sync_usernames(interaction: discord.Interaction):
 # ==========================================
 # 7. 🚨 관리자 명령어 (경고, 코인, 방어권)
 # ==========================================
+# ---------- 관리자 명령어 사용 기록 (로그 채널 저장 + 채팅창 공개 알림) ----------
+NO_MENTIONS = discord.AllowedMentions.none()
+
+
+def set_log_channel_db(cur, guild_id, channel_id):
+    cur.execute(
+        """
+        INSERT INTO guild_settings (guild_id, log_channel_id) VALUES (%s, %s)
+        ON CONFLICT (guild_id) DO UPDATE SET log_channel_id = EXCLUDED.log_channel_id
+        """,
+        (guild_id, channel_id),
+    )
+
+
+def get_log_channel_db(cur, guild_id):
+    cur.execute("SELECT log_channel_id FROM guild_settings WHERE guild_id=%s", (guild_id,))
+    row = cur.fetchone()
+    return int(row[0]) if row and row[0] is not None else None
+
+
+def build_admin_embed(interaction: discord.Interaction, command_name: str, detail: str) -> discord.Embed:
+    user = interaction.user
+    channel_text = getattr(interaction.channel, "mention", None) or "알 수 없음"
+    embed = discord.Embed(
+        title="🛡️ 관리자 명령어 사용",
+        description=f"{user.mention} 님이 `/{command_name}` 명령어를 사용했습니다.",
+        color=discord.Color.orange(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="👤 사용자", value=f"{user.mention}\n`{user}` (`{user.id}`)", inline=True)
+    embed.add_field(name="⌨️ 명령어", value=f"`/{command_name}`", inline=True)
+    embed.add_field(name="📍 사용 채널", value=channel_text, inline=True)
+    embed.add_field(name="📝 내용", value=(detail or "-")[:1000], inline=False)
+    embed.set_footer(text=datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST"))
+    return embed
+
+
+async def send_to_log_channel(guild: discord.Guild, embed: discord.Embed):
+    """
+    /로그 로 설정한 채널에 기록을 남긴다.
+    반환: (True, 채널멘션) 성공 / (None, 사유) 미설정 / (False, 사유) 실패
+    """
+    try:
+        channel_id = await run_db(get_log_channel_db, guild.id)
+    except Exception as e:
+        return False, f"로그 채널 설정 조회 오류: {str(e)[:200]}"
+    if not channel_id:
+        return None, "로그 채널이 설정되지 않았습니다."
+
+    channel = guild.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await guild.fetch_channel(channel_id)
+        except discord.NotFound:
+            return False, "설정된 로그 채널이 삭제되었습니다. `/로그` 로 다시 설정해 주세요."
+        except discord.Forbidden:
+            return False, "봇이 설정된 로그 채널을 볼 수 없습니다. (채널 보기 권한 필요)"
+        except discord.HTTPException as e:
+            return False, f"로그 채널 조회 오류: {e}"
+
+    try:
+        await channel.send(embed=embed, allowed_mentions=NO_MENTIONS)
+    except discord.Forbidden:
+        return False, f"봇에게 {channel.mention} 의 **메시지 보내기 / 링크 첨부** 권한이 없습니다."
+    except discord.HTTPException as e:
+        return False, f"로그 전송 오류: {e}"
+    return True, channel.mention
+
+
+async def finish_admin_command(interaction: discord.Interaction, command_name: str, result_text: str, detail: str):
+    """
+    관리자 명령어가 성공했을 때 마지막에 호출 (반드시 interaction.response.defer() 이후):
+      1) /로그 로 설정한 채널에 '누가 어떤 명령어를 썼는지' 공개 기록 (모두에게 보이는 일반 메시지)
+      2) 실행자에게만 결과 + 기록 성공/실패 안내
+      3) 로그 채널이 미설정/오류일 때만, 기록이 사라지지 않도록 현재 채팅창에 대신 공개
+    """
+    embed = build_admin_embed(interaction, command_name, detail)
+    ok, info = await send_to_log_channel(interaction.guild, embed)
+
+    if ok is True:
+        status = f"\n\n📝 사용 기록을 {info} 에 공개로 남겼습니다."
+    else:
+        if ok is None:
+            status = "\n\n⚠️ 로그 채널이 설정되지 않았습니다. `/로그` 로 채널을 설정해 주세요. (이번 기록은 이 채팅창에 대신 공개했습니다)"
+        else:
+            status = f"\n\n⚠️ 사용 기록 저장 실패: {info}\n(이번 기록은 이 채팅창에 대신 공개했습니다)"
+            print(f"[로그 오류] {interaction.guild_id} /{command_name}: {info}")
+        try:
+            await interaction.followup.send(embed=embed, ephemeral=False, allowed_mentions=NO_MENTIONS)
+        except Exception as e:
+            print(f"[공개 기록 대체 전송 오류] /{command_name}: {e}")
+
+    await interaction.followup.send(result_text + status, ephemeral=True, allowed_mentions=NO_MENTIONS)
+
+
+@bot.tree.command(name="로그", description="이 채널을 관리자 명령어 사용 기록 채널로 지정합니다. (관리자 전용)")
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(administrator=True)
+async def set_log_channel(interaction: discord.Interaction):
+    channel = interaction.channel
+    guild = interaction.guild
+    if channel is None or not hasattr(channel, "send"):
+        await interaction.response.send_message("⚠️ 이 채널은 로그 채널로 지정할 수 없습니다.", ephemeral=True)
+        return
+
+    perms = channel.permissions_for(guild.me)
+    missing = [
+        label for label, ok in (
+            ("채널 보기", perms.view_channel),
+            ("메시지 보내기", perms.send_messages),
+            ("링크 첨부(임베드)", perms.embed_links),
+        ) if not ok
+    ]
+    if missing:
+        await interaction.response.send_message(
+            f"❌ 봇에게 이 채널의 **{', '.join(missing)}** 권한이 없어 지정하지 못했습니다.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await run_db(set_log_channel_db, guild.id, channel.id)
+        await finish_admin_command(
+            interaction, "로그", f"✅ 이 채널({channel.mention})을 로그 채널로 지정했습니다.",
+            f"로그 채널 지정: {channel.mention}",
+        )
+    except Exception as e:
+        print(f"[로그 설정 오류] {e}")
+        await interaction.followup.send(f"❌ 오류: {e}", ephemeral=True)
+
+
 def compute_warning_change(warnings, tickets, amount):
     """
     경고 증감 계산 (DB와 무관한 순수 함수).
@@ -658,16 +795,18 @@ async def handle_add_warning(interaction: discord.Interaction, member: discord.M
     # ---- 차감 (음수) ----
     if amount < 0:
         if r["removed"] == 0:
-            await interaction.followup.send(
+            await finish_admin_command(
+                interaction, "경고지급",
                 f"ℹ️ **{name}**님의 경고는 이미 0회라 차감할 경고가 없습니다.\n"
                 f"현재 경고: **0회** / 방어권: **{r['tickets']}개** (방어권은 변동 없음)",
-                ephemeral=True,
+                f"대상: {member.mention} / 수량: {amount} / 결과: 이미 경고 0회라 차감 없음",
             )
         else:
-            await interaction.followup.send(
+            await finish_admin_command(
+                interaction, "경고지급",
                 f"✅ **{name}**님의 경고를 **{r['removed']}회** 차감했습니다.\n"
                 f"현재 경고: **{r['warnings']}회** / 방어권: **{r['tickets']}개**",
-                ephemeral=True,
+                f"대상: {member.mention} / 수량: {amount} / 결과: 경고 {r['removed']}회 차감 (현재 경고 {r['warnings']}회)",
             )
         return
 
@@ -689,11 +828,18 @@ async def handle_add_warning(interaction: discord.Interaction, member: discord.M
             print(f"[경고 추방 오류] {kick_error}")
             kick_msg = "\n⚠️ 경고는 지급됐지만 추방 처리 중 오류가 발생했습니다."
 
-    await interaction.followup.send(
+    detail = (
+        f"대상: {member.mention} / 수량: +{amount} / 방어권 사용 {r['used']}개 · 경고 부여 {r['added']}회 "
+        f"(현재 경고 {r['warnings']}회, 방어권 {r['tickets']}개)"
+    )
+    if kick_msg:
+        detail += f"\n{kick_msg.strip()}"
+    await finish_admin_command(
+        interaction, "경고지급",
         f"**{name}**님\n" + "\n".join(lines) + "\n"
         f"현재 경고: **{r['warnings']}회** / 남은 방어권: **{r['tickets']}개**"
         f"{kick_msg}",
-        ephemeral=True,
+        detail,
     )
 
 
@@ -722,8 +868,10 @@ async def give_coins(interaction: discord.Interaction, member: discord.Member, a
     await interaction.response.defer(ephemeral=True)
     try:
         balance = await run_db(give_coins_db, interaction.guild_id, member.id, member.name, amount)
-        await interaction.followup.send(
-            f"✅ **{member.display_name}**님에게 **{amount:,}코인**을 지급했습니다! (잔액: {balance:,}코인)", ephemeral=True
+        await finish_admin_command(
+            interaction, "코인지급",
+            f"✅ **{member.display_name}**님에게 **{amount:,}코인**을 지급했습니다! (잔액: {balance:,}코인)",
+            f"대상: {member.mention} / 지급: {amount:,}코인 / 잔액: {balance:,}코인",
         )
     except Exception as e:
         await interaction.followup.send(f"❌ 오류: {e}", ephemeral=True)
@@ -763,8 +911,10 @@ async def take_coins(interaction: discord.Interaction, member: discord.Member, a
         await interaction.followup.send("❌ 유저 데이터를 찾을 수 없습니다.", ephemeral=True)
     else:
         removed, balance = result
-        await interaction.followup.send(
-            f"✅ **{member.display_name}**님의 코인 **{removed:,}개** 회수 완료 (잔액: {balance:,}코인)", ephemeral=True
+        await finish_admin_command(
+            interaction, "코인회수",
+            f"✅ **{member.display_name}**님의 코인 **{removed:,}개** 회수 완료 (잔액: {balance:,}코인)",
+            f"대상: {member.mention} / 요청: {amount:,}코인 / 회수: {removed:,}코인 / 잔액: {balance:,}코인",
         )
 
 
@@ -794,8 +944,10 @@ async def give_defense_ticket(interaction: discord.Interaction, member: discord.
     await interaction.response.defer(ephemeral=True)
     try:
         total = await run_db(give_defense_db, interaction.guild_id, member.id, member.name, amount)
-        await interaction.followup.send(
-            f"🛡️ **{member.display_name}**님에게 방어권 **{amount}개**를 지급했습니다! (보유: {total}개)", ephemeral=True
+        await finish_admin_command(
+            interaction, "방어권지급",
+            f"🛡️ **{member.display_name}**님에게 방어권 **{amount}개**를 지급했습니다! (보유: {total}개)",
+            f"대상: {member.mention} / 지급: {amount}개 / 보유: {total}개",
         )
     except Exception as e:
         await interaction.followup.send(f"❌ 오류: {e}", ephemeral=True)
@@ -1110,7 +1262,7 @@ async def show_commands(interaction: discord.Interaction):
     )
     embed.add_field(
         name="🛡 관리자 전용",
-        value="• `/채팅청소 [수량] [유저]` (수량 입력 후 유저는 선택사항)\n• `/경고지급 [유저] [횟수] [사유]` (횟수에 음수 입력 시 경고 차감)\n• `/코인지급`\n• `/코인회수`\n• `/방어권지급`\n• `/닉네임동기화`",
+        value="• `/채팅청소 [수량] [유저]` (수량 입력 후 유저는 선택사항)\n• `/경고지급 [유저] [횟수] [사유]` (횟수에 음수 입력 시 경고 차감)\n• `/코인지급`\n• `/코인회수`\n• `/방어권지급`\n• `/닉네임동기화`\n• `/로그` (명령어를 입력한 채널을 사용 기록 채널로 지정)",
         inline=False,
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)

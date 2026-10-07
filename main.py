@@ -558,72 +558,127 @@ async def force_sync_usernames(interaction: discord.Interaction):
 # ==========================================
 # 7. 🚨 관리자 명령어 (경고, 코인, 방어권)
 # ==========================================
-def add_warning_db(cur, guild_id, user_id, username):
+def compute_warning_change(warnings, tickets, amount):
+    """
+    경고 증감 계산 (DB와 무관한 순수 함수).
+    - amount > 0 : 경고 amount회 지급. 방어권이 있으면 방어권을 먼저 1개씩 소모해 방어하고,
+                   방어권이 모자란 나머지 횟수만 경고로 쌓임.
+    - amount < 0 : 경고를 |amount|회 차감 (0 밑으로는 내려가지 않음). 방어권은 절대 건드리지 않음.
+    반환: (새 경고, 새 방어권, 소모된 방어권, 실제 추가된 경고, 실제 차감된 경고)
+    """
+    warnings = max(0, int(warnings or 0))
+    tickets = max(0, int(tickets or 0))
+    if amount > 0:
+        used = min(tickets, amount)
+        added = amount - used
+        return warnings + added, tickets - used, used, added, 0
+    if amount < 0:
+        removed = min(warnings, -amount)
+        return warnings - removed, tickets, 0, 0, removed
+    return warnings, tickets, 0, 0, 0
+
+
+def adjust_warning_db(cur, guild_id, user_id, username, amount):
     ensure_user(cur, guild_id, user_id, username)
     cur.execute(
         """
-        UPDATE users SET defense_tickets = defense_tickets - 1
-        WHERE guild_id=%s AND user_id=%s AND COALESCE(defense_tickets, 0) > 0
-        RETURNING defense_tickets
+        SELECT COALESCE(warnings, 0), COALESCE(defense_tickets, 0)
+        FROM users WHERE guild_id=%s AND user_id=%s FOR UPDATE
         """,
         (guild_id, user_id),
     )
-    row = cur.fetchone()
-    if row is not None:
-        return ("defense", int(row[0]))
+    cur_warnings, cur_tickets = cur.fetchone()
+    new_w, new_t, used, added, removed = compute_warning_change(cur_warnings, cur_tickets, amount)
     cur.execute(
         """
-        UPDATE users SET warnings = COALESCE(warnings, 0) + 1, username = %s
+        UPDATE users SET warnings=%s, defense_tickets=%s, username=%s
         WHERE guild_id=%s AND user_id=%s
-        RETURNING warnings
         """,
-        (username, guild_id, user_id),
+        (new_w, new_t, username, guild_id, user_id),
     )
-    return ("warn", int(cur.fetchone()[0]))
+    return {"warnings": new_w, "tickets": new_t, "used": used, "added": added, "removed": removed}
 
 
-@bot.tree.command(name="경고지급", description="특정 유저에게 경고를 1회 지급합니다. (관리자 전용)")
-@app_commands.describe(member="경고를 받을 유저", reason="경고 사유")
+WARNING_DESC = "경고를 지급합니다. 음수를 입력하면 경고가 차감됩니다. (관리자 전용)"
+WARNING_ARGS = dict(
+    member="대상 유저",
+    amount="경고 횟수 (기본 1, 음수 입력 시 차감 / -100~100)",
+    reason="사유",
+)
+
+
+@bot.tree.command(name="경고지급", description=WARNING_DESC)
+@app_commands.describe(**WARNING_ARGS)
 @app_commands.guild_only()
 @app_commands.checks.has_permissions(administrator=True)
-async def add_warning(interaction: discord.Interaction, member: discord.Member, reason: str = "사유 없음"):
-    await handle_add_warning(interaction, member, reason)
+async def add_warning(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    amount: app_commands.Range[int, -100, 100] = 1,
+    reason: str = "사유 없음",
+):
+    await handle_add_warning(interaction, member, amount, reason)
 
 
 # /경고부여 도 같은 기능으로 동작 (이전 이름 호환)
-@bot.tree.command(name="경고부여", description="특정 유저에게 경고를 1회 부여합니다. (관리자 전용)")
-@app_commands.describe(member="경고를 받을 유저", reason="경고 사유")
+@bot.tree.command(name="경고부여", description=WARNING_DESC)
+@app_commands.describe(**WARNING_ARGS)
 @app_commands.guild_only()
 @app_commands.checks.has_permissions(administrator=True)
-async def add_warning_alias(interaction: discord.Interaction, member: discord.Member, reason: str = "사유 없음"):
-    await handle_add_warning(interaction, member, reason)
+async def add_warning_alias(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    amount: app_commands.Range[int, -100, 100] = 1,
+    reason: str = "사유 없음",
+):
+    await handle_add_warning(interaction, member, amount, reason)
 
 
-async def handle_add_warning(interaction: discord.Interaction, member: discord.Member, reason: str):
+async def handle_add_warning(interaction: discord.Interaction, member: discord.Member, amount: int, reason: str):
     if member.bot:
         await interaction.response.send_message("❌ 봇에게는 경고를 부여할 수 없습니다.", ephemeral=True)
+        return
+    if amount == 0:
+        await interaction.response.send_message("❌ 0이 아닌 값을 입력해 주세요. (음수는 차감)", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
     try:
-        kind, value = await run_db(add_warning_db, interaction.guild_id, member.id, member.name)
+        r = await run_db(adjust_warning_db, interaction.guild_id, member.id, member.name, amount)
     except Exception as e:
         print(f"[경고 DB 오류] {e}")
-        await interaction.followup.send(f"❌ 경고 지급 중 오류가 발생했습니다.\n```{str(e)[:1500]}```", ephemeral=True)
+        await interaction.followup.send(f"❌ 경고 처리 중 오류가 발생했습니다.\n```{str(e)[:1500]}```", ephemeral=True)
         return
 
-    if kind == "defense":
-        await interaction.followup.send(
-            f"🛡️ **{member.display_name}**님은 방어권을 사용해 경고를 방어했습니다!\n"
-            f"남은 방어권: **{value}개**\n사유: {reason}",
-            ephemeral=True,
-        )
+    name = member.display_name
+
+    # ---- 차감 (음수) ----
+    if amount < 0:
+        if r["removed"] == 0:
+            await interaction.followup.send(
+                f"ℹ️ **{name}**님의 경고는 이미 0회라 차감할 경고가 없습니다.\n"
+                f"현재 경고: **0회** / 방어권: **{r['tickets']}개** (방어권은 변동 없음)",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                f"✅ **{name}**님의 경고를 **{r['removed']}회** 차감했습니다.\n"
+                f"현재 경고: **{r['warnings']}회** / 방어권: **{r['tickets']}개**\n사유: {reason}",
+                ephemeral=True,
+            )
         return
+
+    # ---- 지급 (양수): 방어권 먼저 소모 ----
+    lines = []
+    if r["used"] > 0:
+        lines.append(f"🛡️ 방어권 **{r['used']}개**를 사용해 경고 {r['used']}회를 방어했습니다.")
+    if r["added"] > 0:
+        lines.append(f"⚠️ 경고 **{r['added']}회**를 부여했습니다.")
 
     kick_msg = ""
-    if value >= 3:
+    if r["added"] > 0 and r["warnings"] >= 3:
         try:
-            await member.kick(reason=f"경고 {value}회 누적: {reason}")
+            await member.kick(reason=f"경고 {r['warnings']}회 누적: {reason}")
             kick_msg = "\n🚪 경고 3회 이상 누적으로 서버에서 추방했습니다."
         except discord.Forbidden:
             kick_msg = "\n⚠️ 경고는 지급됐지만 봇에게 추방 권한이 없어 추방하지 못했습니다."
@@ -632,8 +687,9 @@ async def handle_add_warning(interaction: discord.Interaction, member: discord.M
             kick_msg = "\n⚠️ 경고는 지급됐지만 추방 처리 중 오류가 발생했습니다."
 
     await interaction.followup.send(
-        f"⚠️ **{member.display_name}**님에게 경고 **1회**를 부여했습니다.\n"
-        f"현재 경고: **{value}회**\n사유: {reason}{kick_msg}",
+        f"**{name}**님\n" + "\n".join(lines) + "\n"
+        f"현재 경고: **{r['warnings']}회** / 남은 방어권: **{r['tickets']}개**\n"
+        f"사유: {reason}{kick_msg}",
         ephemeral=True,
     )
 
@@ -1083,7 +1139,7 @@ async def show_commands(interaction: discord.Interaction):
     )
     embed.add_field(
         name="🛡 관리자 전용",
-        value="• `/채팅청소 [수량] [유저]` (수량 입력 후 유저는 선택사항)\n• `/경고지급` (또는 `/경고부여`)\n• `/경고차감`\n• `/코인지급`\n• `/코인회수`\n• `/방어권지급`\n• `/닉네임동기화`",
+        value="• `/채팅청소 [수량] [유저]` (수량 입력 후 유저는 선택사항)\n• `/경고지급 [유저] [횟수] [사유]` (음수 입력 시 차감, `/경고부여`도 동일)\n• `/경고차감`\n• `/코인지급`\n• `/코인회수`\n• `/방어권지급`\n• `/닉네임동기화`",
         inline=False,
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)

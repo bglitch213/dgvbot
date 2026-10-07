@@ -327,15 +327,19 @@ async def on_ready():
         except Exception:
             pass
 
-    if not commands_synced:
+    # 재연결로 on_ready 가 다시 불려도 매번 동기화해서 명령어 목록이 항상 최신이 되게 함
+    # (서버별로 따로 try/except → 한 서버가 실패해도 다른 서버는 계속 진행)
+    all_ok = True
+    for guild in bot.guilds:
         try:
-            for guild in bot.guilds:
-                bot.tree.copy_global_to(guild=guild)
-                synced = await bot.tree.sync(guild=guild)
-                print(f"[COMMAND SYNC] {guild.name} ({guild.id}) -> {len(synced)}개")
-            commands_synced = True
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            names = ", ".join(c.name for c in synced)
+            print(f"[COMMAND SYNC] {guild.name} ({guild.id}) -> {len(synced)}개: {names}")
         except Exception as e:
-            print(f"명령어 동기화 오류: {e}")
+            all_ok = False
+            print(f"[COMMAND SYNC] {guild.name} ({guild.id}) 동기화 오류: {e}")
+    commands_synced = all_ok
 
     # 이미 음성 채널에 들어와 있는 유저 세션 복구
     try:
@@ -578,11 +582,24 @@ def add_warning_db(cur, guild_id, user_id, username):
     return ("warn", int(cur.fetchone()[0]))
 
 
-@bot.tree.command(name="경고부여", description="특정 유저에게 경고를 1회 부여합니다. (관리자 전용)")
+@bot.tree.command(name="경고지급", description="특정 유저에게 경고를 1회 지급합니다. (관리자 전용)")
 @app_commands.describe(member="경고를 받을 유저", reason="경고 사유")
 @app_commands.guild_only()
 @app_commands.checks.has_permissions(administrator=True)
 async def add_warning(interaction: discord.Interaction, member: discord.Member, reason: str = "사유 없음"):
+    await handle_add_warning(interaction, member, reason)
+
+
+# /경고부여 도 같은 기능으로 동작 (이전 이름 호환)
+@bot.tree.command(name="경고부여", description="특정 유저에게 경고를 1회 부여합니다. (관리자 전용)")
+@app_commands.describe(member="경고를 받을 유저", reason="경고 사유")
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(administrator=True)
+async def add_warning_alias(interaction: discord.Interaction, member: discord.Member, reason: str = "사유 없음"):
+    await handle_add_warning(interaction, member, reason)
+
+
+async def handle_add_warning(interaction: discord.Interaction, member: discord.Member, reason: str):
     if member.bot:
         await interaction.response.send_message("❌ 봇에게는 경고를 부여할 수 없습니다.", ephemeral=True)
         return
@@ -1066,7 +1083,7 @@ async def show_commands(interaction: discord.Interaction):
     )
     embed.add_field(
         name="🛡 관리자 전용",
-        value="• `/채팅청소 [수량] [유저]` (수량 입력 후 유저는 선택사항)\n• `/경고부여`\n• `/경고차감`\n• `/코인지급`\n• `/코인회수`\n• `/방어권지급`\n• `/닉네임동기화`",
+        value="• `/채팅청소 [수량] [유저]` (수량 입력 후 유저는 선택사항)\n• `/경고지급` (또는 `/경고부여`)\n• `/경고차감`\n• `/코인지급`\n• `/코인회수`\n• `/방어권지급`\n• `/닉네임동기화`",
         inline=False,
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)

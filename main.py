@@ -620,20 +620,6 @@ async def add_warning(
     await handle_add_warning(interaction, member, amount, reason)
 
 
-# /경고부여 도 같은 기능으로 동작 (이전 이름 호환)
-@bot.tree.command(name="경고부여", description=WARNING_DESC)
-@app_commands.describe(**WARNING_ARGS)
-@app_commands.guild_only()
-@app_commands.checks.has_permissions(administrator=True)
-async def add_warning_alias(
-    interaction: discord.Interaction,
-    member: discord.Member,
-    amount: app_commands.Range[int, -100, 100] = 1,
-    reason: str = "사유 없음",
-):
-    await handle_add_warning(interaction, member, amount, reason)
-
-
 async def handle_add_warning(interaction: discord.Interaction, member: discord.Member, amount: int, reason: str):
     if member.bot:
         await interaction.response.send_message("❌ 봇에게는 경고를 부여할 수 없습니다.", ephemeral=True)
@@ -692,38 +678,6 @@ async def handle_add_warning(interaction: discord.Interaction, member: discord.M
         f"사유: {reason}{kick_msg}",
         ephemeral=True,
     )
-
-
-def remove_warning_db(cur, guild_id, user_id):
-    cur.execute(
-        "SELECT COALESCE(warnings, 0) FROM users WHERE guild_id=%s AND user_id=%s FOR UPDATE",
-        (guild_id, user_id),
-    )
-    row = cur.fetchone()
-    current = row[0] if row else 0
-    if current <= 0:
-        return None
-    cur.execute("UPDATE users SET warnings = warnings - 1 WHERE guild_id=%s AND user_id=%s", (guild_id, user_id))
-    return current - 1
-
-
-@bot.tree.command(name="경고차감", description="특정 유저의 경고를 1회 차감합니다. (관리자 전용)")
-@app_commands.describe(member="경고를 차감할 유저")
-@app_commands.guild_only()
-@app_commands.checks.has_permissions(administrator=True)
-async def remove_warning(interaction: discord.Interaction, member: discord.Member):
-    await interaction.response.defer(ephemeral=True)
-    try:
-        result = await run_db(remove_warning_db, interaction.guild_id, member.id)
-    except Exception as e:
-        await interaction.followup.send(f"❌ 오류 발생: {e}", ephemeral=True)
-        return
-    if result is None:
-        await interaction.followup.send(f"❌ **{member.display_name}**님의 경고는 이미 0회입니다.", ephemeral=True)
-    else:
-        await interaction.followup.send(
-            f"✅ **{member.display_name}**님의 경고를 1회 차감했습니다. (현재 경고: {result}회)", ephemeral=True
-        )
 
 
 def give_coins_db(cur, guild_id, user_id, username, amount):
@@ -1139,7 +1093,7 @@ async def show_commands(interaction: discord.Interaction):
     )
     embed.add_field(
         name="🛡 관리자 전용",
-        value="• `/채팅청소 [수량] [유저]` (수량 입력 후 유저는 선택사항)\n• `/경고지급 [유저] [횟수] [사유]` (음수 입력 시 차감, `/경고부여`도 동일)\n• `/경고차감`\n• `/코인지급`\n• `/코인회수`\n• `/방어권지급`\n• `/닉네임동기화`",
+        value="• `/채팅청소 [수량] [유저]` (수량 입력 후 유저는 선택사항)\n• `/경고지급 [유저] [횟수] [사유]` (횟수에 음수 입력 시 경고 차감)\n• `/코인지급`\n• `/코인회수`\n• `/방어권지급`\n• `/닉네임동기화`",
         inline=False,
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)

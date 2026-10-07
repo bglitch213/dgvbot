@@ -473,6 +473,7 @@ async def on_voice_state_update(member, before, after):
 # ==========================================
 @bot.tree.command(name="채팅청소", description="지정한 수량만큼 채팅을 삭제합니다. (선택적으로 특정 유저만 삭제 가능)")
 @app_commands.describe(limit="삭제할 메시지 수 (1~100)", member="청소할 대상 유저 (선택하지 않으면 전체 최근 메시지)")
+@app_commands.rename(limit="수량", member="유저")
 @app_commands.guild_only()
 @app_commands.checks.has_permissions(administrator=True)
 async def clear_user_chat(interaction: discord.Interaction, limit: int = 20, member: discord.Member = None):
@@ -481,14 +482,21 @@ async def clear_user_chat(interaction: discord.Interaction, limit: int = 20, mem
         return
 
     channel = interaction.channel
+    # 캐시에 없는 채널(PartialMessageable 등)이면 실제 채널 객체로 교체
+    if channel is None or not hasattr(channel, "delete_messages"):
+        try:
+            channel = interaction.guild.get_channel_or_thread(interaction.channel_id) \
+                or await interaction.guild.fetch_channel(interaction.channel_id)
+        except Exception:
+            channel = None
     if channel is None or not hasattr(channel, "history") or not hasattr(channel, "delete_messages"):
         await interaction.response.send_message("⚠️ 이 채널에서는 청소할 수 없습니다.", ephemeral=True)
         return
 
     perms = channel.permissions_for(interaction.guild.me)
-    if not (perms.manage_messages and perms.read_message_history):
+    if not (perms.view_channel and perms.manage_messages and perms.read_message_history):
         await interaction.response.send_message(
-            "❌ 봇에게 이 채널의 **메시지 관리** 및 **메시지 기록 보기** 권한이 필요합니다.", ephemeral=True
+            "❌ 봇에게 이 채널의 **채널 보기 / 메시지 관리 / 메시지 기록 보기** 권한이 필요합니다.", ephemeral=True
         )
         return
 
@@ -496,8 +504,9 @@ async def clear_user_chat(interaction: discord.Interaction, limit: int = 20, mem
 
     try:
         messages_to_delete = []
+        searched_limit = 500
         if member:
-            async for message in channel.history(limit=500):
+            async for message in channel.history(limit=searched_limit):
                 if message.author.id == member.id:
                     messages_to_delete.append(message)
                     if len(messages_to_delete) >= limit:
@@ -522,6 +531,26 @@ async def clear_user_chat(interaction: discord.Interaction, limit: int = 20, mem
                 old_messages.append(m)
 
         deleted_count = 0
+        failed_count = 0
+        fail_reasons = set()
+
+        def _reason(e: Exception) -> str:
+            if isinstance(e, discord.Forbidden):
+                return "봇 권한 부족(메시지 관리)"
+            status = getattr(e, "status", "")
+            text = str(getattr(e, "text", "") or e)[:60]
+            return f"{status} {text}".strip()
+
+        async def _delete_one(m) -> bool:
+            try:
+                await m.delete()
+                return True
+            except discord.NotFound:
+                return True  # 이미 삭제된 메시지
+            except Exception as e:
+                fail_reasons.add(_reason(e))
+                return False
+
         for i in range(0, len(recent_messages), 100):
             chunk = recent_messages[i:i + 100]
             try:
@@ -530,23 +559,45 @@ async def clear_user_chat(interaction: discord.Interaction, limit: int = 20, mem
                 else:
                     await chunk[0].delete()
                 deleted_count += len(chunk)
+            except discord.Forbidden as e:
+                failed_count += len(chunk)
+                fail_reasons.add(_reason(e))
             except discord.HTTPException as e:
-                print(f"[채팅청소 오류] {e}")
+                # 일괄 삭제 실패 시 한 개씩 다시 시도
+                print(f"[채팅청소 일괄삭제 오류 → 개별 삭제로 재시도] {e}")
+                for m in chunk:
+                    if await _delete_one(m):
+                        deleted_count += 1
+                    else:
+                        failed_count += 1
+                    await asyncio.sleep(0.3)
 
         for m in old_messages:
-            try:
-                await m.delete()
+            if await _delete_one(m):
                 deleted_count += 1
-                await asyncio.sleep(0.5)
-            except Exception:
-                pass
+            else:
+                failed_count += 1
+            await asyncio.sleep(0.5)
 
-        await finish_admin_command(
-            interaction, "채팅청소",
-            f"🧹 {target_name} 메시지 **{deleted_count}개**를 성공적으로 청소했습니다!",
-            f"대상: {member.mention if member else '채널 전체 최근 메시지'} / 삭제: {deleted_count}개",
-        )
+        if deleted_count == 0 and failed_count > 0:
+            await interaction.followup.send(
+                f"❌ 메시지를 삭제하지 못했습니다. (실패 {failed_count}개)\n사유: {', '.join(fail_reasons) or '알 수 없음'}",
+                ephemeral=True,
+            )
+            return
+
+        result = f"🧹 {target_name} 메시지 **{deleted_count}개**를 청소했습니다!"
+        detail = f"대상: {member.mention if member else '채널 전체 최근 메시지'} / 요청: {limit}개 / 삭제: {deleted_count}개"
+        if member and len(messages_to_delete) < limit:
+            result += f"\nℹ️ 최근 {searched_limit}개 메시지 안에서 {len(messages_to_delete)}개만 찾았습니다."
+        if failed_count:
+            reasons = ", ".join(fail_reasons) or "알 수 없음"
+            result += f"\n⚠️ {failed_count}개는 삭제하지 못했습니다. (사유: {reasons})"
+            detail += f" / 실패: {failed_count}개"
+
+        await finish_admin_command(interaction, "채팅청소", result, detail)
     except Exception as e:
+        print(f"[채팅청소 오류] {e}")
         await interaction.followup.send(f"❌ 메시지 청소 중 오류가 발생했습니다: {e}", ephemeral=True)
 
 

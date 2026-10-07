@@ -316,6 +316,29 @@ def resync_voice_sessions_sync(entries, now):
             print(f"[VOICE DEBUG] 세션 복구 오류: {e}")
 
 
+_last_guild_sync = {}  # guild_id -> 마지막 동기화 시각 (너무 잦은 동기화 방지)
+
+
+async def sync_guild_commands(guild: discord.Guild, min_interval: float = 0.0) -> bool:
+    """이 서버의 슬래시 명령어를 현재 코드 기준으로 디스코드에 덮어써서 맞춘다."""
+    now = time.time()
+    if now - _last_guild_sync.get(guild.id, 0) < min_interval:
+        return False
+    _last_guild_sync[guild.id] = now
+    try:
+        bot.tree.copy_global_to(guild=guild)
+        synced = await bot.tree.sync(guild=guild)
+        names = ", ".join(c.name for c in synced)
+        print(f"[COMMAND SYNC] {guild.name} ({guild.id}) -> {len(synced)}개: {names}")
+        for c in synced:
+            if c.name == "경고지급":
+                print(f"[COMMAND SYNC] 경고지급 입력칸: {[o.name for o in c.options]}")
+        return True
+    except Exception as e:
+        print(f"[COMMAND SYNC] {guild.name} ({guild.id}) 동기화 오류: {e}")
+        return False
+
+
 @bot.event
 async def on_ready():
     global commands_synced
@@ -327,30 +350,16 @@ async def on_ready():
         except Exception:
             pass
 
-    # 재연결로 on_ready 가 다시 불려도 매번 동기화해서 명령어 목록이 항상 최신이 되게 함
-    # (서버별로 따로 try/except → 한 서버가 실패해도 다른 서버는 계속 진행)
-    all_ok = True
-
-    # 예전 버전이 '전역'으로 등록해 둔 낡은 명령어(수량 입력칸이 없는 옛 /경고지급 등)가
-    # 서버 명령어와 겹쳐 보이는 것을 막기 위해 전역 등록분을 비움 (서버별 등록은 아래에서 따로 함)
+    # 예전 버전이 '전역'으로 등록해 둔 낡은 명령어가 서버 명령어와 겹쳐 보이는 것을 막기 위해
+    # 전역 등록분을 비움 (서버별 등록은 아래에서 따로 함)
     try:
         await bot.http.bulk_upsert_global_commands(bot.application_id, [])
     except Exception as e:
         print(f"[COMMAND SYNC] 전역 명령어 정리 실패(무시 가능): {e}")
 
-    for guild in bot.guilds:
-        try:
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
-            names = ", ".join(c.name for c in synced)
-            print(f"[COMMAND SYNC] {guild.name} ({guild.id}) -> {len(synced)}개: {names}")
-            for c in synced:
-                if c.name == "경고지급":
-                    print(f"[COMMAND SYNC] 경고지급 입력칸: {[o.name for o in c.options]}")
-        except Exception as e:
-            all_ok = False
-            print(f"[COMMAND SYNC] {guild.name} ({guild.id}) 동기화 오류: {e}")
-    commands_synced = all_ok
+    # 재연결로 on_ready 가 다시 불려도 매번 동기화 (서버별로 따로 처리 → 한 서버가 실패해도 계속 진행)
+    results = [await sync_guild_commands(guild) for guild in bot.guilds]
+    commands_synced = all(results)
 
     # 이미 음성 채널에 들어와 있는 유저 세션 복구
     try:
@@ -375,18 +384,24 @@ async def on_guild_join(guild: discord.Guild):
         await guild.chunk(cache=True)
     except Exception:
         pass
-    try:
-        bot.tree.copy_global_to(guild=guild)
-        synced = await bot.tree.sync(guild=guild)
-        print(f"[COMMAND SYNC] 새 서버 {guild.name} ({guild.id}) -> {len(synced)}개")
-    except Exception as e:
-        print(f"[COMMAND SYNC] 새 서버 동기화 오류: {e}")
+    await sync_guild_commands(guild)
 
 
 # 모든 슬래시 명령어의 공통 오류 처리 (응답 없음 방지)
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
+    if isinstance(error, app_commands.CommandSignatureMismatch):
+        # 디스코드에 등록된 명령어 모양이 코드와 다름 → 이 서버 명령어를 바로 다시 동기화(자동 복구)
+        print(f"[명령어 오류] 시그니처 불일치: {getattr(error.command, 'name', '?')} → 자동 재동기화 시도")
+        fixed = False
+        if interaction.guild is not None:
+            fixed = await sync_guild_commands(interaction.guild, min_interval=30)
+        if fixed:
+            msg = ("🔄 명령어 정보가 오래돼서 방금 자동으로 갱신했습니다.\n"
+                   "**디스코드 앱을 새로고침(Ctrl+R, 모바일은 앱 완전 종료 후 재실행)** 한 뒤 다시 입력해 주세요.")
+        else:
+            msg = ("🔄 명령어 정보를 갱신 중입니다. 잠시 후 **디스코드 앱을 새로고침(Ctrl+R)** 하고 다시 입력해 주세요.")
+    elif isinstance(error, app_commands.MissingPermissions):
         msg = "❌ 이 명령어는 **서버 관리자**만 사용할 수 있습니다."
     elif isinstance(error, app_commands.NoPrivateMessage):
         msg = "❌ 서버 안에서만 사용할 수 있는 명령어입니다."

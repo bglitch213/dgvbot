@@ -330,12 +330,23 @@ async def on_ready():
     # 재연결로 on_ready 가 다시 불려도 매번 동기화해서 명령어 목록이 항상 최신이 되게 함
     # (서버별로 따로 try/except → 한 서버가 실패해도 다른 서버는 계속 진행)
     all_ok = True
+
+    # 예전 버전이 '전역'으로 등록해 둔 낡은 명령어(수량 입력칸이 없는 옛 /경고지급 등)가
+    # 서버 명령어와 겹쳐 보이는 것을 막기 위해 전역 등록분을 비움 (서버별 등록은 아래에서 따로 함)
+    try:
+        await bot.http.bulk_upsert_global_commands(bot.application_id, [])
+    except Exception as e:
+        print(f"[COMMAND SYNC] 전역 명령어 정리 실패(무시 가능): {e}")
+
     for guild in bot.guilds:
         try:
             bot.tree.copy_global_to(guild=guild)
             synced = await bot.tree.sync(guild=guild)
             names = ", ".join(c.name for c in synced)
             print(f"[COMMAND SYNC] {guild.name} ({guild.id}) -> {len(synced)}개: {names}")
+            for c in synced:
+                if c.name == "경고지급":
+                    print(f"[COMMAND SYNC] 경고지급 입력칸: {[o.name for o in c.options]}")
         except Exception as e:
             all_ok = False
             print(f"[COMMAND SYNC] {guild.name} ({guild.id}) 동기화 오류: {e}")
@@ -599,33 +610,24 @@ def adjust_warning_db(cur, guild_id, user_id, username, amount):
     return {"warnings": new_w, "tickets": new_t, "used": used, "added": added, "removed": removed}
 
 
-WARNING_DESC = "경고를 지급합니다. 음수를 입력하면 경고가 차감됩니다. (관리자 전용)"
-WARNING_ARGS = dict(
-    member="대상 유저",
-    amount="경고 횟수 (기본 1, 음수 입력 시 차감 / -100~100)",
-    reason="사유",
-)
-
-
-@bot.tree.command(name="경고지급", description=WARNING_DESC)
-@app_commands.describe(**WARNING_ARGS)
+@bot.tree.command(name="경고지급", description="경고를 지급/차감합니다. 수량이 양수면 지급, 음수면 차감 (관리자 전용)")
+@app_commands.describe(member="대상 유저", amount="경고 수량 (양수 = 지급, 음수 = 차감)")
+@app_commands.rename(member="닉네임", amount="수량")
 @app_commands.guild_only()
 @app_commands.checks.has_permissions(administrator=True)
-async def add_warning(
-    interaction: discord.Interaction,
-    member: discord.Member,
-    amount: app_commands.Range[int, -100, 100] = 1,
-    reason: str = "사유 없음",
-):
-    await handle_add_warning(interaction, member, amount, reason)
+async def add_warning(interaction: discord.Interaction, member: discord.Member, amount: int):
+    await handle_add_warning(interaction, member, amount)
 
 
-async def handle_add_warning(interaction: discord.Interaction, member: discord.Member, amount: int, reason: str):
+async def handle_add_warning(interaction: discord.Interaction, member: discord.Member, amount: int):
     if member.bot:
         await interaction.response.send_message("❌ 봇에게는 경고를 부여할 수 없습니다.", ephemeral=True)
         return
     if amount == 0:
-        await interaction.response.send_message("❌ 0이 아닌 값을 입력해 주세요. (음수는 차감)", ephemeral=True)
+        await interaction.response.send_message("❌ 수량은 0이 될 수 없습니다. (양수 = 지급, 음수 = 차감)", ephemeral=True)
+        return
+    if abs(amount) > 100:
+        await interaction.response.send_message("❌ 수량은 -100 ~ 100 사이로 입력해 주세요.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -649,7 +651,7 @@ async def handle_add_warning(interaction: discord.Interaction, member: discord.M
         else:
             await interaction.followup.send(
                 f"✅ **{name}**님의 경고를 **{r['removed']}회** 차감했습니다.\n"
-                f"현재 경고: **{r['warnings']}회** / 방어권: **{r['tickets']}개**\n사유: {reason}",
+                f"현재 경고: **{r['warnings']}회** / 방어권: **{r['tickets']}개**",
                 ephemeral=True,
             )
         return
@@ -664,7 +666,7 @@ async def handle_add_warning(interaction: discord.Interaction, member: discord.M
     kick_msg = ""
     if r["added"] > 0 and r["warnings"] >= 3:
         try:
-            await member.kick(reason=f"경고 {r['warnings']}회 누적: {reason}")
+            await member.kick(reason=f"경고 {r['warnings']}회 누적")
             kick_msg = "\n🚪 경고 3회 이상 누적으로 서버에서 추방했습니다."
         except discord.Forbidden:
             kick_msg = "\n⚠️ 경고는 지급됐지만 봇에게 추방 권한이 없어 추방하지 못했습니다."
@@ -674,8 +676,8 @@ async def handle_add_warning(interaction: discord.Interaction, member: discord.M
 
     await interaction.followup.send(
         f"**{name}**님\n" + "\n".join(lines) + "\n"
-        f"현재 경고: **{r['warnings']}회** / 남은 방어권: **{r['tickets']}개**\n"
-        f"사유: {reason}{kick_msg}",
+        f"현재 경고: **{r['warnings']}회** / 남은 방어권: **{r['tickets']}개**"
+        f"{kick_msg}",
         ephemeral=True,
     )
 

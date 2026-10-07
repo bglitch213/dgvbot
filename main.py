@@ -63,7 +63,10 @@ def init_db():
             PRIMARY KEY (guild_id, user_id)
         )
     """)
+    # 기존 users 테이블을 사용하는 경우에도 필요한 컬럼을 자동으로 보완합니다.
     cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT DEFAULT NULL")
+    cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS warnings INTEGER DEFAULT 0")
+    cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS defense_tickets INTEGER DEFAULT 0")
     cursor.execute("ALTER TABLE voice_sessions ADD COLUMN IF NOT EXISTS counting_since DOUBLE PRECISION DEFAULT NULL")
     cursor.execute("ALTER TABLE voice_sessions ADD COLUMN IF NOT EXISTS accumulated_seconds DOUBLE PRECISION DEFAULT 0")
 
@@ -95,27 +98,6 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 commands_synced = False
 
-async def sync_application_commands():
-    """
-    슬래시 명령어를 길드별로 즉시 동기화합니다.
-    기존 길드 명령어를 clear()하지 않아 다른 명령어가 실수로 삭제되는 것을 방지합니다.
-    """
-    global commands_synced
-
-    synced_guilds = 0
-    for guild in bot.guilds:
-        try:
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
-            synced_guilds += 1
-            print(f"[COMMAND SYNC] {guild.name} ({guild.id}) -> {len(synced)}개")
-        except Exception as e:
-            print(f"[COMMAND SYNC ERROR] {guild.name} ({guild.id}): {type(e).__name__}: {e}")
-
-    commands_synced = synced_guilds == len(bot.guilds)
-    return synced_guilds
-
-
 @bot.event
 async def on_ready():
     global commands_synced
@@ -124,59 +106,37 @@ async def on_ready():
     for guild in bot.guilds:
         try:
             await guild.chunk(cache=True)
-        except Exception as e:
-            print(f"[MEMBER CHUNK ERROR] {guild.name}: {e}")
+        except Exception:
+            pass
 
     if not commands_synced:
-        await sync_application_commands()
+        try:
+            for guild in bot.guilds:
+                bot.tree.copy_global_to(guild=guild)
+                synced = await bot.tree.sync(guild=guild)
+                print(f"[COMMAND SYNC] {guild.name} ({guild.id}) -> {len(synced)}개")
+            commands_synced = True
+        except Exception as e:
+            print(f"명령어 동기화 오류: {e}")
 
     if not check_voice_time.is_running():
         check_voice_time.start()
-
-
-@bot.event
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    """모든 슬래시 명령어의 권한 및 실행 오류를 중앙에서 처리합니다."""
-    if isinstance(error, app_commands.MissingPermissions):
-        message = "❌ 이 명령어는 **서버 관리자(Administrator)**만 사용할 수 있습니다."
-    elif isinstance(error, app_commands.CheckFailure):
-        message = "❌ 이 명령어를 실행할 권한이 없습니다."
-    elif isinstance(error, app_commands.CommandNotFound):
-        message = "❌ 명령어를 찾을 수 없습니다. 잠시 후 다시 시도해 주세요."
-    else:
-        original = getattr(error, "original", error)
-        print(f"[APP COMMAND ERROR] {type(original).__name__}: {original}")
-        message = f"❌ 명령어 실행 중 오류가 발생했습니다: `{type(original).__name__}`"
-
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
-        else:
-            await interaction.response.send_message(message, ephemeral=True)
-    except Exception as send_error:
-        print(f"[APP COMMAND ERROR RESPONSE FAILED] {send_error}")
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
     try:
         await guild.chunk(cache=True)
-    except Exception as e:
-        print(f"[MEMBER CHUNK ERROR] {guild.name}: {e}")
-
-    try:
-        bot.tree.copy_global_to(guild=guild)
-        synced = await bot.tree.sync(guild=guild)
-        print(f"[COMMAND SYNC] 새 서버 {guild.name} ({guild.id}) -> {len(synced)}개")
-    except Exception as e:
-        print(f"[COMMAND SYNC ERROR] 새 서버 {guild.name} ({guild.id}): {type(e).__name__}: {e}")
+    except Exception:
+        pass
+    bot.tree.copy_global_to(guild=guild)
+    synced = await bot.tree.sync(guild=guild)
+    print(f"[COMMAND SYNC] 새 서버 {guild.name} ({guild.id}) -> {len(synced)}개")
 
 @tasks.loop(minutes=1)
 async def check_voice_time():
-    conn = None
-    cur = None
+    conn = get_db()
+    cur = conn.cursor()
     try:
-        conn = get_db()
-        cur = conn.cursor()
         cur.execute("SELECT guild_id, user_id, join_time, counting_since, accumulated_seconds FROM voice_sessions")
         sessions = cur.fetchall()
 
@@ -275,21 +235,8 @@ async def check_voice_time():
         conn.rollback()
         print(f"[VOICE DEBUG] 전체 음성 체크 오류: {e}")
     finally:
-        if cur is not None:
-            cur.close()
-        if conn is not None:
-            conn.close()
-
-
-@check_voice_time.before_loop
-async def before_check_voice_time():
-    await bot.wait_until_ready()
-
-
-@check_voice_time.error
-async def check_voice_time_error(error):
-    print(f"[VOICE LOOP ERROR] {type(error).__name__}: {error}")
-
+        cur.close()
+        conn.close()
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -305,11 +252,9 @@ async def on_voice_state_update(member, before, after):
     is_connected = after.channel is not None
     muted_after = after.self_mute or after.self_deaf
 
-    conn = None
-    cursor = None
+    conn = get_db()
+    cursor = conn.cursor()
     try:
-        conn = get_db()
-        cursor = conn.cursor()
         cursor.execute(
             """
             SELECT join_time, counting_since, COALESCE(accumulated_seconds, 0)
@@ -422,32 +367,18 @@ async def on_voice_state_update(member, before, after):
         conn.rollback()
         print(f"[음성 상태 업데이트 오류] {e}")
     finally:
-        if cursor is not None:
-            cursor.close()
-        if conn is not None:
-            conn.close()
+        cursor.close()
+        conn.close()
 
 
 # ==========================================
 # 🧹 채팅 청소 명령어 (수량 먼저, 멤버는 선택사항)
 # ==========================================
-@bot.tree.command(name="채팅청소", description="지정한 수량만큼 최근 메시지를 정확히 삭제합니다. (특정 유저 선택 가능)")
-@app_commands.describe(
-    limit="삭제할 메시지 수 (1~100)",
-    member="청소할 대상 유저 (선택하지 않으면 전체 최근 메시지)"
-)
-@app_commands.default_permissions(administrator=True)
+@bot.tree.command(name="채팅청소", description="지정한 수량만큼 채팅을 순서대로 삭제합니다. (선택적으로 특정 유저만 삭제 가능)")
+@app_commands.describe(limit="삭제할 메시지 수 (1~100)", member="청소할 대상 유저 (선택하지 않으면 전체 최근 메시지)")
 @app_commands.checks.has_permissions(administrator=True)
-async def clear_user_chat(
-    interaction: discord.Interaction,
-    limit: int = 20,
-    member: discord.Member = None
-):
+async def clear_user_chat(interaction: discord.Interaction, limit: int = 20, member: discord.Member = None):
     await interaction.response.defer(thinking=True, ephemeral=True)
-
-    if interaction.guild is None or interaction.channel is None:
-        await interaction.followup.send("❌ 서버의 텍스트 채널에서만 사용할 수 있습니다.", ephemeral=True)
-        return
 
     if limit < 1 or limit > 100:
         await interaction.followup.send("⚠️ 삭제 수량은 1부터 100 사이로 입력해 주세요.", ephemeral=True)
@@ -455,22 +386,19 @@ async def clear_user_chat(
 
     try:
         messages_to_delete = []
-
-        # 기존 limit + 1을 제거했습니다.
-        # 이제 입력한 수량만큼 정확히 가져옵니다.
-        if member is None:
-            async for message in interaction.channel.history(limit=limit):
-                messages_to_delete.append(message)
-            target_name = "최근"
-        else:
-            # 특정 유저 메시지는 최대 500개까지 탐색하지만
-            # 실제 삭제 대상은 입력한 limit개로 정확히 제한합니다.
+        
+        if member:
             async for message in interaction.channel.history(limit=500):
                 if message.author.id == member.id:
                     messages_to_delete.append(message)
                     if len(messages_to_delete) >= limit:
                         break
             target_name = f"**{member.display_name}**님의"
+        else:
+            async for message in interaction.channel.history(limit=limit + 1):
+                if message.id != interaction.id:
+                    messages_to_delete.append(message)
+            target_name = "최근"
 
         if not messages_to_delete:
             await interaction.followup.send("⚠️ 삭제할 대화 내역을 찾지 못했습니다.", ephemeral=True)
@@ -479,75 +407,42 @@ async def clear_user_chat(
         now = datetime.now(timezone.utc)
         recent_messages = []
         old_messages = []
-
-        for message in messages_to_delete:
-            if (now - message.created_at).total_seconds() < 14 * 24 * 60 * 60:
-                recent_messages.append(message)
+        
+        for m in messages_to_delete:
+            if (now - m.created_at).days < 14:
+                recent_messages.append(m)
             else:
-                old_messages.append(message)
+                old_messages.append(m)
 
         deleted_count = 0
-        failed_count = 0
-
-        # 14일 이내 메시지는 Bulk Delete
-        for i in range(0, len(recent_messages), 100):
-            chunk = recent_messages[i:i + 100]
-            try:
-                if len(chunk) == 1:
-                    await chunk[0].delete()
-                else:
+        if recent_messages:
+            for i in range(0, len(recent_messages), 100):
+                chunk = recent_messages[i:i+100]
+                if len(chunk) > 1:
                     await interaction.channel.delete_messages(chunk)
-                deleted_count += len(chunk)
-            except discord.HTTPException:
-                # Bulk Delete 실패 시 개별 삭제 재시도
-                for message in chunk:
-                    try:
-                        await message.delete()
-                        deleted_count += 1
-                    except discord.HTTPException:
-                        failed_count += 1
+                    deleted_count += len(chunk)
+                else:
+                    await chunk[0].delete()
+                    deleted_count += 1
 
-        # 14일 초과 메시지는 개별 삭제
-        for message in old_messages:
+        for m in old_messages:
             try:
-                await message.delete()
+                await m.delete()
                 deleted_count += 1
-                await asyncio.sleep(0.35)
-            except discord.HTTPException:
-                failed_count += 1
+                await asyncio.sleep(0.5)
+            except Exception:
+                pass
 
-        result = f"🧹 {target_name} 메시지 **{deleted_count}개**를 삭제했습니다."
-        if failed_count:
-            result += f"\n⚠️ Discord 제한/권한 문제로 **{failed_count}개**는 삭제하지 못했습니다."
-
-        await interaction.followup.send(result, ephemeral=True)
-
-    except discord.Forbidden:
         await interaction.followup.send(
-            "❌ 봇에게 **메시지 관리(Manage Messages)** 권한이 없습니다.",
-            ephemeral=True
-        )
-    except discord.HTTPException as e:
-        await interaction.followup.send(
-            f"❌ Discord API 오류로 청소에 실패했습니다: `{e}`",
+            f"🧹 {target_name} 메시지 **{deleted_count}개**를 성공적으로 청소했습니다!", 
             ephemeral=True
         )
     except Exception as e:
-        print(f"[CHAT CLEAN ERROR] {type(e).__name__}: {e}")
-        await interaction.followup.send(
-            f"❌ 메시지 청소 중 예상하지 못한 오류가 발생했습니다: `{type(e).__name__}`",
-            ephemeral=True
-        )
+        await interaction.followup.send(f"❌ 메시지 청소 중 오류가 발생했습니다: {e}", ephemeral=True)
 
 @clear_user_chat.error
 async def clear_user_chat_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        msg = "❌ 이 명령어는 **서버 관리자**만 사용할 수 있습니다."
-    else:
-        original = getattr(error, "original", error)
-        print(f"[CHAT CLEAN COMMAND ERROR] {type(original).__name__}: {original}")
-        msg = f"❌ 청소 명령어 오류: `{type(original).__name__}`"
-
+    msg = "❌ 이 명령어는 **서버 관리자**만 사용할 수 있습니다." if isinstance(error, app_commands.MissingPermissions) else f"❌ 오류 발생: {error}"
     if not interaction.response.is_done():
         await interaction.response.send_message(msg, ephemeral=True)
     else:
@@ -558,7 +453,6 @@ async def clear_user_chat_error(interaction: discord.Interaction, error: app_com
 # 🔄 닉네임 일괄 동기화 명령어
 # ==========================================
 @bot.tree.command(name="닉네임동기화", description="서버 내 모든 멤버의 닉네임을 DB에 강제로 일괄 동기화합니다.")
-@app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def force_sync_usernames(interaction: discord.Interaction):
     guild = interaction.guild
@@ -593,59 +487,124 @@ async def force_sync_usernames(interaction: discord.Interaction):
 # ==========================================
 @bot.tree.command(name="경고부여", description="특정 유저에게 경고를 1회 부여합니다. (관리자 전용)")
 @app_commands.describe(member="경고를 받을 유저", reason="경고 사유")
-@app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def add_warning(interaction: discord.Interaction, member: discord.Member, reason: str = "사유 없음"):
+    if interaction.guild_id is None:
+        await interaction.response.send_message("❌ 서버에서만 사용할 수 있습니다.", ephemeral=True)
+        return
+
     if member.bot:
-        await interaction.response.send_message("봇에게는 경고를 부여할 수 없습니다.", ephemeral=True)
+        await interaction.response.send_message("❌ 봇에게는 경고를 부여할 수 없습니다.", ephemeral=True)
         return
 
     guild_id = interaction.guild_id
     user_id = member.id
-    conn = get_db()
-    cursor = conn.cursor()
+    conn = None
+    cursor = None
+
     try:
-        cursor.execute("SELECT defense_tickets, warnings FROM users WHERE guild_id = %s AND user_id = %s", (guild_id, user_id))
-        row = cursor.fetchone()
-        defense_tickets = row[0] if row else 0
-        current_warnings = row[1] if row else 0
+        conn = get_db()
+        cursor = conn.cursor()
 
-        if defense_tickets > 0:
-            cursor.execute("UPDATE users SET defense_tickets = defense_tickets - 1 WHERE guild_id = %s AND user_id = %s", (guild_id, user_id))
-            conn.commit()
-            await interaction.response.send_message(f"🛡️ **{member.display_name}**님은 방어권을 보유하고 있어 경고를 **방어**했습니다!", ephemeral=True)
-            return
-
-        new_warnings = current_warnings + 1
+        # 기존 유저 데이터가 없어도 먼저 생성한 뒤 경고/방어권을 처리합니다.
         cursor.execute(
             """
-            INSERT INTO users (guild_id, user_id, username, warnings)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (guild_id, user_id) DO UPDATE SET warnings = users.warnings + 1, username = EXCLUDED.username
+            INSERT INTO users (guild_id, user_id, username, coins, voice_minutes, warnings, defense_tickets)
+            VALUES (%s, %s, %s, 0, 0, 0, 0)
+            ON CONFLICT (guild_id, user_id) DO UPDATE SET username = EXCLUDED.username
             """,
-            (guild_id, user_id, member.name, 1)
+            (guild_id, user_id, member.name),
         )
+
+        # 방어권이 있다면 경고 대신 방어권 1개를 소모합니다.
+        cursor.execute(
+            """
+            UPDATE users
+            SET defense_tickets = defense_tickets - 1
+            WHERE guild_id = %s AND user_id = %s AND COALESCE(defense_tickets, 0) > 0
+            RETURNING defense_tickets
+            """,
+            (guild_id, user_id),
+        )
+        defense_row = cursor.fetchone()
+
+        if defense_row is not None:
+            conn.commit()
+            await interaction.response.send_message(
+                f"🛡️ **{member.display_name}**님은 방어권을 사용해 경고를 방어했습니다!\n"
+                f"남은 방어권: **{defense_row[0]}개**\n"
+                f"사유: {reason}",
+                ephemeral=True,
+            )
+            return
+
+        # 경고를 원자적으로 +1 하고 실제 저장된 값을 반환합니다.
+        cursor.execute(
+            """
+            UPDATE users
+            SET warnings = COALESCE(warnings, 0) + 1, username = %s
+            WHERE guild_id = %s AND user_id = %s
+            RETURNING warnings
+            """,
+            (member.name, guild_id, user_id),
+        )
+        warning_row = cursor.fetchone()
+
+        if warning_row is None:
+            raise RuntimeError("경고 데이터 업데이트에 실패했습니다.")
+
+        new_warnings = int(warning_row[0])
         conn.commit()
 
+        # 3회 이상이면 추방을 시도합니다. DB 저장은 이미 완료된 상태입니다.
         kick_msg = ""
         if new_warnings >= 3:
             try:
-                await member.kick(reason="경고 3회 누적")
-                kick_msg = " (경고 3회 누적으로 추방됨)"
-            except Exception:
-                pass
+                await member.kick(reason=f"경고 {new_warnings}회 누적: {reason}")
+                kick_msg = "\n🚪 경고 3회 이상 누적으로 서버에서 추방했습니다."
+            except discord.Forbidden:
+                kick_msg = "\n⚠️ 경고는 지급됐지만 봇에게 추방 권한이 없어 추방하지 못했습니다."
+            except discord.HTTPException as kick_error:
+                print(f"[경고 추방 오류] {kick_error}")
+                kick_msg = "\n⚠️ 경고는 지급됐지만 추방 처리 중 오류가 발생했습니다."
 
-        await interaction.response.send_message(f"⚠️ **{member.display_name}**님에게 경고를 부여했습니다. (현재 경고: {new_warnings}회){kick_msg}", ephemeral=True)
+        await interaction.response.send_message(
+            f"⚠️ **{member.display_name}**님에게 경고 **1회**를 부여했습니다.\n"
+            f"현재 경고: **{new_warnings}회**\n"
+            f"사유: {reason}{kick_msg}",
+            ephemeral=True,
+        )
+
+    except psycopg2.Error as db_error:
+        if conn is not None:
+            conn.rollback()
+        print(f"[경고 DB 오류] {db_error}")
+        message = (
+            "❌ 경고 지급 중 DB 오류가 발생했습니다.\n"
+            f"```{str(db_error)[:1000]}```"
+            "\nDB 테이블의 `warnings` / `defense_tickets` 컬럼도 자동 보정하도록 수정되어 있습니다."
+        )
+        if not interaction.response.is_done():
+            await interaction.response.send_message(message, ephemeral=True)
+        else:
+            await interaction.followup.send(message, ephemeral=True)
     except Exception as e:
-        conn.rollback()
-        await interaction.response.send_message(f"❌ 오류 발생: {e}", ephemeral=True)
+        if conn is not None:
+            conn.rollback()
+        print(f"[경고 지급 오류] {e}")
+        message = f"❌ 경고 지급 중 오류가 발생했습니다.\n```{str(e)[:1500]}```"
+        if not interaction.response.is_done():
+            await interaction.response.send_message(message, ephemeral=True)
+        else:
+            await interaction.followup.send(message, ephemeral=True)
     finally:
-        cursor.close()
-        conn.close()
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
 
 @bot.tree.command(name="경고차감", description="특정 유저의 경고를 1회 차감합니다. (관리자 전용)")
 @app_commands.describe(member="경고를 차감할 유저")
-@app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def remove_warning(interaction: discord.Interaction, member: discord.Member):
     guild_id = interaction.guild_id
@@ -673,7 +632,6 @@ async def remove_warning(interaction: discord.Interaction, member: discord.Membe
 
 @bot.tree.command(name="코인지급", description="특정 유저에게 코인을 지급합니다. (관리자 전용)")
 @app_commands.describe(member="코인을 받을 유저", amount="지급할 코인 수량")
-@app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def give_coins(interaction: discord.Interaction, member: discord.Member, amount: int):
     if amount <= 0:
@@ -701,7 +659,6 @@ async def give_coins(interaction: discord.Interaction, member: discord.Member, a
 
 @bot.tree.command(name="코인회수", description="특정 유저의 코인을 회수합니다. (관리자 전용)")
 @app_commands.describe(member="코인을 회수할 유저", amount="회수할 코인 수량")
-@app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def take_coins(interaction: discord.Interaction, member: discord.Member, amount: int):
     if amount <= 0:
@@ -720,7 +677,6 @@ async def take_coins(interaction: discord.Interaction, member: discord.Member, a
         )
         row = cursor.fetchone()
         if not row:
-            conn.rollback()
             await interaction.response.send_message("❌ 유저 데이터를 찾을 수 없습니다.", ephemeral=True)
             return
         conn.commit()
@@ -734,7 +690,6 @@ async def take_coins(interaction: discord.Interaction, member: discord.Member, a
 
 @bot.tree.command(name="방어권지급", description="특정 유저에게 방어권을 지급합니다. (관리자 전용)")
 @app_commands.describe(member="방어권을 받을 유저", amount="지급할 수량")
-@app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def give_defense_ticket(interaction: discord.Interaction, member: discord.Member, amount: int = 1):
     if amount <= 0:
@@ -969,24 +924,8 @@ async def register_referral(interaction: discord.Interaction, referrer: discord.
     setting = cursor.fetchone()
     reward = setting[0] if setting else 30
 
-    cursor.execute(
-        """
-        INSERT INTO users (guild_id, user_id, username, referred_by)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (guild_id, user_id)
-        DO UPDATE SET referred_by = EXCLUDED.referred_by, username = EXCLUDED.username
-        """,
-        (guild_id, user_id, interaction.user.name, referrer.id)
-    )
-    cursor.execute(
-        """
-        INSERT INTO users (guild_id, user_id, username, coins)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (guild_id, user_id)
-        DO UPDATE SET coins = users.coins + EXCLUDED.coins, username = EXCLUDED.username
-        """,
-        (guild_id, referrer.id, referrer.name, reward)
-    )
+    cursor.execute("UPDATE users SET referred_by = %s WHERE guild_id = %s AND user_id = %s", (referrer.id, guild_id, user_id))
+    cursor.execute("INSERT INTO users (guild_id, user_id, coins) VALUES (%s, %s, %s) ON CONFLICT (guild_id, user_id) DO UPDATE SET coins = users.coins + EXCLUDED.coins", (guild_id, referrer.id, reward))
     conn.commit()
     cursor.close()
     conn.close()

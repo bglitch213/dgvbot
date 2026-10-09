@@ -1303,6 +1303,45 @@ async def coin_ranking(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
+# ---------- 슬롯머신 환수율 (숨김 명령어: /명령어 목록에 표시하지 않음) ----------
+def set_slot_rtp_db(cur, guild_id, rtp):
+    cur.execute(
+        """
+        INSERT INTO guild_settings (guild_id, slot_rtp) VALUES (%s, %s)
+        ON CONFLICT (guild_id) DO UPDATE SET slot_rtp = EXCLUDED.slot_rtp
+        """,
+        (guild_id, rtp),
+    )
+
+
+def get_slot_rtp_db(cur, guild_id):
+    cur.execute("SELECT slot_rtp FROM guild_settings WHERE guild_id=%s", (guild_id,))
+    r = cur.fetchone()
+    return int(r[0]) if r and r[0] is not None else 85
+
+
+@bot.tree.command(name="슬롯환수율", description="슬롯머신 환수율(%)을 설정/확인합니다. (관리자 전용)")
+@app_commands.describe(percent="환수율 % (0~150, 비우면 현재 값 확인)")
+@app_commands.rename(percent="퍼센트")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def set_slot_rtp(interaction: discord.Interaction, percent: app_commands.Range[int, 0, 150] = None):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        if percent is None:
+            current = await run_db(get_slot_rtp_db, interaction.guild.id)
+            await interaction.followup.send(f"🎰 현재 슬롯머신 환수율: **{current}%**", ephemeral=True)
+            return
+        old = await run_db(get_slot_rtp_db, interaction.guild.id)
+        await run_db(set_slot_rtp_db, interaction.guild.id, percent)
+        # 비공개 명령어이므로 로그 채널/채팅창에 공개 기록을 남기지 않고 본인에게만 응답합니다.
+        await interaction.followup.send(f"🎰 슬롯머신 환수율을 **{old}% → {percent}%** 로 변경했습니다.", ephemeral=True)
+    except Exception as e:
+        print(f"[슬롯환수율 오류] {e}")
+        await interaction.followup.send(f"❌ 오류: {e}", ephemeral=True)
+
+
 @bot.tree.command(name="명령어", description="봇 명령어 목록을 확인합니다.")
 async def show_commands(interaction: discord.Interaction):
     embed = discord.Embed(title="🤖 봇 명령어 안내", color=discord.Color.blue())
@@ -1311,11 +1350,15 @@ async def show_commands(interaction: discord.Interaction):
         value="• `/정보 [유저]`\n• `/추천인 [유저]`\n• `/슬롯머신 [배팅액]`\n• `/코인순위`\n• `/명령어`",
         inline=False,
     )
-    embed.add_field(
-        name="🛡 관리자 전용",
-        value="• `/채팅청소 [수량] [유저]` (수량 입력 후 유저는 선택사항)\n• `/경고지급 [유저] [횟수] [사유]` (횟수에 음수 입력 시 경고 차감)\n• `/코인지급`\n• `/코인회수`\n• `/방어권지급`\n• `/닉네임동기화`\n• `/로그` (명령어를 입력한 채널을 사용 기록 채널로 지정)",
-        inline=False,
-    )
+
+    # 관리자에게만 관리자 명령어 목록을 보여줍니다. (일반 유저에게는 숨김)
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if perms is not None and perms.administrator:
+        embed.add_field(
+            name="🛡 관리자 전용",
+            value="• `/채팅청소 [수량] [유저]` (수량 입력 후 유저는 선택사항)\n• `/경고지급 [유저] [횟수] [사유]` (횟수에 음수 입력 시 경고 차감)\n• `/코인지급`\n• `/코인회수`\n• `/방어권지급`\n• `/닉네임동기화`\n• `/로그` (명령어를 입력한 채널을 사용 기록 채널로 지정)",
+            inline=False,
+        )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 

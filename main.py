@@ -1303,7 +1303,7 @@ async def coin_ranking(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
-# ---------- 슬롯머신 환수율 (숨김 명령어: /명령어 목록에 표시하지 않음) ----------
+# ---------- 슬롯머신 환수율 (숨김 명령어 /슬롯머신설정: /명령어 목록에 표시하지 않음) ----------
 def set_slot_rtp_db(cur, guild_id, rtp):
     cur.execute(
         """
@@ -1320,25 +1320,21 @@ def get_slot_rtp_db(cur, guild_id):
     return int(r[0]) if r and r[0] is not None else 85
 
 
-@bot.tree.command(name="슬롯환수율", description="슬롯머신 환수율(%)을 설정/확인합니다. (관리자 전용)")
-@app_commands.describe(percent="환수율 % (0~150, 비우면 현재 값 확인)")
-@app_commands.rename(percent="퍼센트")
+@bot.tree.command(name="슬롯머신설정", description="슬롯머신 환수율(%)을 설정합니다. (관리자 전용)")
+@app_commands.describe(percent="환수율 % (0~150)")
+@app_commands.rename(percent="환수율")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
-async def set_slot_rtp(interaction: discord.Interaction, percent: app_commands.Range[int, 0, 150] = None):
+async def set_slot_rtp(interaction: discord.Interaction, percent: app_commands.Range[int, 0, 150]):
     await interaction.response.defer(ephemeral=True)
     try:
-        if percent is None:
-            current = await run_db(get_slot_rtp_db, interaction.guild.id)
-            await interaction.followup.send(f"🎰 현재 슬롯머신 환수율: **{current}%**", ephemeral=True)
-            return
         old = await run_db(get_slot_rtp_db, interaction.guild.id)
         await run_db(set_slot_rtp_db, interaction.guild.id, percent)
         # 비공개 명령어이므로 로그 채널/채팅창에 공개 기록을 남기지 않고 본인에게만 응답합니다.
         await interaction.followup.send(f"🎰 슬롯머신 환수율을 **{old}% → {percent}%** 로 변경했습니다.", ephemeral=True)
     except Exception as e:
-        print(f"[슬롯환수율 오류] {e}")
+        print(f"[슬롯머신설정 오류] {e}")
         await interaction.followup.send(f"❌ 오류: {e}", ephemeral=True)
 
 

@@ -1303,6 +1303,73 @@ async def coin_ranking(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
+# ---------- 음성채팅 이용 순위 ----------
+def format_minutes(total_minutes: int) -> str:
+    hours, minutes = divmod(int(total_minutes), 60)
+    if hours and minutes:
+        return f"{hours:,}시간 {minutes}분"
+    if hours:
+        return f"{hours:,}시간"
+    return f"{minutes}분"
+
+
+def voice_ranking_db(cur, guild_id, user_id):
+    cur.execute(
+        """
+        SELECT user_id, COALESCE(voice_minutes, 0)
+        FROM users
+        WHERE guild_id=%s AND COALESCE(voice_minutes, 0) > 0
+        ORDER BY voice_minutes DESC, user_id ASC
+        LIMIT 10
+        """,
+        (guild_id,),
+    )
+    rows = cur.fetchall()
+
+    cur.execute(
+        "SELECT COALESCE(voice_minutes, 0) FROM users WHERE guild_id=%s AND user_id=%s",
+        (guild_id, user_id),
+    )
+    me = cur.fetchone()
+    my_minutes = int(me[0]) if me else 0
+    my_rank = None
+    if my_minutes > 0:
+        cur.execute(
+            "SELECT COUNT(*) + 1 FROM users WHERE guild_id=%s AND COALESCE(voice_minutes, 0) > %s",
+            (guild_id, my_minutes),
+        )
+        my_rank = int(cur.fetchone()[0])
+    return rows, my_minutes, my_rank
+
+
+@bot.tree.command(name="이용순위", description="음성채팅방 누적 이용 시간 상위 10명을 확인합니다.")
+@app_commands.guild_only()
+async def voice_ranking(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        rows, my_minutes, my_rank = await run_db(voice_ranking_db, interaction.guild_id, interaction.user.id)
+    except Exception as e:
+        await interaction.followup.send(f"❌ 오류: {e}", ephemeral=True)
+        return
+
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines = [
+        f"{medals.get(i, f'{i}.')} <@{uid}> — **{format_minutes(m)}**"
+        for i, (uid, m) in enumerate(rows, start=1)
+    ] if rows else ["아직 음성채팅 이용 기록이 없습니다."]
+
+    embed = discord.Embed(
+        title=f"🎙️ {interaction.guild.name} 음성채팅 이용 순위",
+        description="\n".join(lines),
+        color=discord.Color.green(),
+    )
+    if my_rank is not None:
+        embed.set_footer(text=f"내 순위: {my_rank}위 · {format_minutes(my_minutes)}")
+    else:
+        embed.set_footer(text="내 순위: 아직 이용 기록이 없습니다.")
+    await interaction.followup.send(embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
 # ---------- 슬롯머신 환수율 (숨김 명령어 /슬롯머신설정: /명령어 목록에 표시하지 않음) ----------
 def set_slot_rtp_db(cur, guild_id, rtp):
     cur.execute(
@@ -1343,7 +1410,7 @@ async def show_commands(interaction: discord.Interaction):
     embed = discord.Embed(title="🤖 봇 명령어 안내", color=discord.Color.blue())
     embed.add_field(
         name="👤 일반 명령어",
-        value="• `/정보 [유저]`\n• `/추천인 [유저]`\n• `/슬롯머신 [배팅액]`\n• `/코인순위`\n• `/명령어`",
+        value="• `/정보 [유저]`\n• `/추천인 [유저]`\n• `/슬롯머신 [배팅액]`\n• `/코인순위`\n• `/이용순위`\n• `/명령어`",
         inline=False,
     )
 

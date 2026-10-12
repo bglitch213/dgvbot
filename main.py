@@ -320,6 +320,11 @@ def resync_voice_sessions_sync(entries, now):
 _last_guild_sync = {}  # guild_id -> 마지막 동기화 시각 (너무 잦은 동기화 방지)
 
 
+BOT_VERSION = "2026-10-12 이용순위 포함판"
+_sync_status = {}           # guild.id -> 등록 결과 문자열 (시작 보고 DM용)
+_startup_report_sent = False
+
+
 async def sync_guild_commands(guild: discord.Guild, min_interval: float = 0.0) -> bool:
     """이 서버의 슬래시 명령어를 현재 코드 기준으로 디스코드에 덮어써서 맞춘다."""
     now = time.time()
@@ -331,12 +336,15 @@ async def sync_guild_commands(guild: discord.Guild, min_interval: float = 0.0) -
         synced = await bot.tree.sync(guild=guild)
         names = ", ".join(c.name for c in synced)
         print(f"[COMMAND SYNC] {guild.name} ({guild.id}) -> {len(synced)}개: {names}")
+        has_rank = any(c.name == "이용순위" for c in synced)
+        _sync_status[guild.id] = f"✅ {guild.name}: {len(synced)}개 등록 (/이용순위 {'있음' if has_rank else '없음'})"
         for c in synced:
             if c.name == "경고지급":
                 print(f"[COMMAND SYNC] 경고지급 입력칸: {[o.name for o in c.options]}")
         return True
     except Exception as e:
         print(f"[COMMAND SYNC] {guild.name} ({guild.id}) 동기화 오류: {e}")
+        _sync_status[guild.id] = f"❌ {guild.name}: 등록 실패 — {str(e)[:400]}"
         return False
 
 
@@ -361,6 +369,18 @@ async def on_ready():
     # 재연결로 on_ready 가 다시 불려도 매번 동기화 (서버별로 따로 처리 → 한 서버가 실패해도 계속 진행)
     results = [await sync_guild_commands(guild) for guild in bot.guilds]
     commands_synced = all(results)
+
+    # 진단용: 봇 소유자에게 시작/명령어 등록 결과를 DM으로 1회 보고 (콘솔을 볼 수 없어도 확인 가능)
+    global _startup_report_sent
+    if not _startup_report_sent:
+        _startup_report_sent = True
+        try:
+            info = await bot.application_info()
+            owner = info.team.owner if info.team else info.owner
+            report = "\n".join(_sync_status.get(g.id, f"⚠️ {g.name}: 결과 없음") for g in bot.guilds) or "참여한 서버 없음"
+            await owner.send(f"🤖 **봇 시작 보고**\n실행 중인 코드 버전: `{BOT_VERSION}`\n{report}")
+        except Exception as e:
+            print(f"[시작 보고 DM 실패] {e}")
 
     # 이미 음성 채널에 들어와 있는 유저 세션 복구
     try:

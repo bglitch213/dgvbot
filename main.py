@@ -177,6 +177,7 @@ def init_db():
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT DEFAULT NULL")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS warnings INTEGER DEFAULT 0")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS defense_tickets INTEGER DEFAULT 0")
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS baccarat_streak INTEGER DEFAULT 0")
         cur.execute("ALTER TABLE voice_sessions ADD COLUMN IF NOT EXISTS counting_since DOUBLE PRECISION DEFAULT NULL")
         cur.execute("ALTER TABLE voice_sessions ADD COLUMN IF NOT EXISTS accumulated_seconds DOUBLE PRECISION DEFAULT 0")
         cur.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS slot_rtp INTEGER DEFAULT 85")
@@ -1624,26 +1625,39 @@ def baccarat_payout(choice: str, winner: str, bet: int) -> int:
 
 
 def play_baccarat_db(cur, guild_id, user_id, bet, choice):
-    """결과를 먼저 계산하고, 베팅 차감+지급을 UPDATE 한 번(원자적)으로 처리. 코인 부족이면 변동 없음."""
+    """결과를 먼저 계산하고, 베팅 차감+지급+연승 갱신을 UPDATE 한 번(원자적)으로 처리. 코인 부족이면 변동 없음.
+    연승: 적중이면 +1, 빗나가면 0 으로 초기화, 타이(환불)는 그대로 유지."""
     win_rate = get_cached_setting(cur, guild_id, "baccarat_win_rate")
     win_rate = int(win_rate) if win_rate is not None else None
     hand = deal_baccarat_rigged(choice, win_rate)
     payout = baccarat_payout(choice, hand["winner"], bet)
+    if hand["winner"] == choice:
+        outcome = "win"
+    elif hand["winner"] == "tie":
+        outcome = "tie"
+    else:
+        outcome = "lose"
 
     cur.execute(
         """
-        UPDATE users SET coins = COALESCE(coins, 0) - %s + %s
+        UPDATE users SET
+            coins = COALESCE(coins, 0) - %s + %s,
+            baccarat_streak = CASE %s::text
+                WHEN 'win' THEN COALESCE(baccarat_streak, 0) + 1
+                WHEN 'lose' THEN 0
+                ELSE COALESCE(baccarat_streak, 0)
+            END
         WHERE guild_id=%s AND user_id=%s AND COALESCE(coins, 0) >= %s
-        RETURNING coins
+        RETURNING coins, baccarat_streak
         """,
-        (bet, payout, guild_id, user_id, bet),
+        (bet, payout, outcome, guild_id, user_id, bet),
     )
     row = cur.fetchone()
     if row is None:
         cur.execute("SELECT COALESCE(coins, 0) FROM users WHERE guild_id=%s AND user_id=%s", (guild_id, user_id))
         r = cur.fetchone()
         return {"ok": False, "coins": int(r[0]) if r else 0}
-    return {"ok": True, **hand, "payout": payout, "coins": int(row[0])}
+    return {"ok": True, **hand, "payout": payout, "coins": int(row[0]), "streak": int(row[1] or 0)}
 
 
 def _fmt_hand(hand) -> str:
@@ -1669,6 +1683,7 @@ def build_baccarat_text(res, bet: int, choice: str) -> str:
         f"🔴 뱅커 `{_fmt_hand(res['banker'])}` = **{res['bt']}**\n"
         f"➡️ {winner_label}\n\n"
         f"{result_text}\n💰 현재 잔액: **{res['coins']:,}코인**"
+        + (f"\n🔥 **{res['streak']}연승** 중!" if res.get("streak", 0) >= 1 else "")
     )
 
 

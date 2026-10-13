@@ -1302,12 +1302,12 @@ def deal_baccarat_rigged(choice: str, win_rate):
 
 
 def baccarat_payout(choice: str, winner: str, bet: int) -> int:
-    """지급액(원금 포함). 플레이어 1:1 / 뱅커 1:1 / 타이 8:1, 타이 시 플레이어·뱅커 배팅은 환불."""
+    """지급액(원금 포함). 플레이어 1:1 / 뱅커 0.95:1 / 타이 8:1, 타이 시 플레이어·뱅커 배팅은 환불."""
     if winner == "tie":
         return bet * 9 if choice == "tie" else bet
     if choice != winner:
         return 0
-    return bet * 2
+    return bet * 2 if choice == "player" else bet + (bet * 95) // 100
 
 
 def play_baccarat_db(cur, guild_id, user_id, bet, choice):
@@ -1351,7 +1351,10 @@ def build_baccarat_text(res, bet: int, choice: str) -> str:
     payout = res["payout"]
     net = payout - bet
     if res["winner"] == choice:
-        result_text = f"🎉 **[적중!]** **{payout:,}코인** 획득! (순이익 {net:+,})"
+        if net > 0:
+            result_text = f"🎉 **[적중!]** **{payout:,}코인** 획득! (순이익 {net:+,})"
+        else:
+            result_text = f"✅ **[적중]** 뱅커 수수료(5%) 적용으로 {payout:,}코인을 돌려받았습니다. (손익 {net:+,})"
     elif payout == bet:
         result_text = f"🤝 **[타이 - 환불]** 배팅한 {bet:,}코인을 돌려받았습니다."
     else:
@@ -1427,7 +1430,7 @@ class BaccaratView(discord.ui.View):
     async def bet_player(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._play(interaction, "player")
 
-    @discord.ui.button(label="🔴 뱅커 (1:1)", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="🔴 뱅커 (0.95:1)", style=discord.ButtonStyle.danger)
     async def bet_banker(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._play(interaction, "banker")
 
@@ -1479,7 +1482,7 @@ async def baccarat(interaction: discord.Interaction, bet: app_commands.Range[int
         await interaction.response.send_message(
             f"🃏 **[바카라]** 배팅 **{bet:,}코인**\n"
             "어디에 걸까요? 아래 버튼을 눌러 선택하세요. (60초 안에 선택)\n"
-            "• 🔵 플레이어 승 1:1\n• 🔴 뱅커 승 1:1\n• 🟢 타이 8:1 (타이 시 플레이어·뱅커 배팅은 환불)",
+            "• 🔵 플레이어 승 1:1\n• 🔴 뱅커 승 0.95:1 (수수료 5%)\n• 🟢 타이 8:1 (타이 시 플레이어·뱅커 배팅은 환불)",
             view=view,
         )
         view.message = await interaction.original_response()

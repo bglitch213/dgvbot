@@ -1940,6 +1940,19 @@ if __name__ == "__main__":
         raise SystemExit(1)
     try:
         bot.run(token)
+    except discord.errors.HTTPException as e:
+        if getattr(e, "status", None) != 429:
+            raise
+        # 디스코드/Cloudflare 가 이 서버의 IP 를 일시 차단한 상태(429).
+        # 바로 종료하면 Render 가 즉시 재시작 → 로그인 재시도가 쌓여 차단이 계속 길어지므로,
+        # 프로세스는 살려 둔 채(웹서버는 계속 응답) 오래 기다렸다가 스스로 다시 시작한다.
+        tries = int(os.getenv("DISCORD_429_TRIES", "0")) + 1
+        wait_min = min(15 * tries, 60)          # 15분 → 30분 → 45분 → 60분(최대)
+        print(f"[로그인 차단 429] 디스코드가 요청을 일시 차단했습니다. {wait_min}분 뒤 다시 시도합니다. (시도 {tries}회째)", flush=True)
+        time.sleep(wait_min * 60)
+        os.environ["DISCORD_429_TRIES"] = str(tries)
+        import sys
+        os.execv(sys.executable, [sys.executable] + sys.argv)
     except discord.errors.PrivilegedIntentsRequired as e:
         print(f"[시작 오류] 개발자 포털에서 특권 인텐트가 꺼져 있습니다: {e}")
         if os.getenv("NO_MESSAGE_CONTENT") != "1":

@@ -1217,7 +1217,7 @@ BACCARAT_RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "
 BACCARAT_SUITS = ["♠", "♥", "♦", "♣"]
 BACCARAT_CHOICES = {"player": "🔵 플레이어", "banker": "🔴 뱅커", "tie": "🟢 타이"}
 BACCARAT_MIN_BET = 1
-BACCARAT_MAX_BET = 250
+BACCARAT_MAX_BET = 100
 active_baccarat = set()
 baccarat_semaphore = asyncio.Semaphore(50)
 BACCARAT_MAX_TABLES = 50   # 동시에 열려 있을 수 있는 바카라 판 수 (무료 서버 부하 방지)
@@ -1721,7 +1721,7 @@ async def set_slot_rtp(interaction: discord.Interaction, percent: app_commands.R
 #  - 서버 관리자가 아닌 사람이 입력하면 아무 반응도 하지 않습니다.
 #  - 봇 DM 에서 입력하면 본인이 관리자인 모든 서버에 적용됩니다.
 import re
-BACCARAT_RATE_RE = re.compile(r"^/?바카라승률\s+(-?\d{1,3})$")
+BACCARAT_RATE_RE = re.compile(r"^/?바카라승률(?:\s+(-?\d{1,3}))?$")
 
 
 def set_baccarat_rate_db(cur, guild_id, rate):
@@ -1747,7 +1747,7 @@ async def on_message(message: discord.Message):
 
     m = BACCARAT_RATE_RE.match((message.content or "").strip())
     if m:
-        percent = int(m.group(1))
+        percent = int(m.group(1)) if m.group(1) is not None else None  # None = 현재 값만 조회
         # 대상 서버 결정 + 관리자 확인
         if message.guild is not None:
             member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
@@ -1766,7 +1766,17 @@ async def on_message(message: discord.Message):
                 except Exception:
                     pass
 
-            if not (-1 <= percent <= 100):
+            if percent is None:
+                # 숫자 없이 입력하면 현재 설정값만 DM 으로 알려줌
+                try:
+                    lines = []
+                    for g in guilds:
+                        cur_rate = await run_db(get_baccarat_rate_db, g.id)
+                        lines.append(f"🃏 [{g.name}] 현재 바카라 승률: **{'원래 확률(조작 없음)' if cur_rate is None else f'{cur_rate}%'}**")
+                    reply = "\n".join(lines)
+                except Exception as e:
+                    reply = f"❌ 오류: {str(e)[:300]}"
+            elif not (-1 <= percent <= 100):
                 reply = "❌ 승률은 0~100 사이로 입력해 주세요. (-1 = 조작 해제)"
             else:
                 new = None if percent < 0 else percent

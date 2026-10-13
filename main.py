@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import asyncio
 import random
@@ -18,6 +19,12 @@ from psycopg2.extras import execute_values
 # ==========================================
 # 0. 렌더(Render) 24시간 유지용 Flask 웹서버 (가장 먼저 실행)
 # ==========================================
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 app = Flask(__name__)
 
 
@@ -356,13 +363,7 @@ async def sync_guild_commands(guild: discord.Guild, min_interval: float = 0.0) -
 @bot.event
 async def on_ready():
     global commands_synced
-    print(f"로그인 완료: {bot.user}")
-
-    for guild in bot.guilds:
-        try:
-            await guild.chunk(cache=True)
-        except Exception:
-            pass
+    print(f"로그인 완료: {bot.user}", flush=True)
 
     # 예전 버전이 '전역'으로 등록해 둔 낡은 명령어가 서버 명령어와 겹쳐 보이는 것을 막기 위해
     # 전역 등록분을 비움 (서버별 등록은 아래에서 따로 함)
@@ -386,6 +387,13 @@ async def on_ready():
             await owner.send(f"🤖 **봇 시작 보고**\n실행 중인 코드 버전: `{BOT_VERSION}`\n{report}")
         except Exception as e:
             print(f"[시작 보고 DM 실패] {e}")
+
+    # 멤버 목록 불러오기 (오래 걸리거나 막혀도 위의 명령어 등록에는 영향 없도록 뒤로 이동 + 시간 제한)
+    for guild in bot.guilds:
+        try:
+            await asyncio.wait_for(guild.chunk(cache=True), timeout=60)
+        except Exception as e:
+            print(f"[MEMBER CHUNK] {guild.name} 멤버 불러오기 실패/지연: {e}", flush=True)
 
     # 이미 음성 채널에 들어와 있는 유저 세션 복구
     try:

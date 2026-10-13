@@ -291,7 +291,9 @@ intents = discord.Intents.default()
 intents.guilds = True
 intents.voice_states = True
 intents.members = True  # 개발자 포털에서 SERVER MEMBERS INTENT 를 반드시 켜야 합니다.
-intents.message_content = True  # 숨김 명령어(/바카라승률) 용. 개발자 포털에서 MESSAGE CONTENT INTENT 를 켜야 합니다.
+# 숨김 명령어(/바카라승률) 용. 개발자 포털에서 MESSAGE CONTENT INTENT 를 켜야 합니다.
+# (꺼져 있으면 아래 시작부에서 자동으로 이 기능만 끄고 봇은 정상 시작합니다.)
+intents.message_content = os.getenv("NO_MESSAGE_CONTENT") != "1"
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 commands_synced = False
@@ -323,7 +325,7 @@ def resync_voice_sessions_sync(entries, now):
 _last_guild_sync = {}  # guild_id -> 마지막 동기화 시각 (너무 잦은 동기화 방지)
 
 
-BOT_VERSION = "2026-10-12 바카라 포함판"
+BOT_VERSION = "2026-10-14 바카라 수정판"
 _sync_status = {}           # guild.id -> 등록 결과 문자열 (시작 보고 DM용)
 _startup_report_sent = False
 
@@ -1810,4 +1812,15 @@ if __name__ == "__main__":
     if not token:
         print("❌ 에러: DISCORD_TOKEN 환경 변수가 설정되지 않았습니다!")
         raise SystemExit(1)
-    bot.run(token)
+    try:
+        bot.run(token)
+    except discord.errors.PrivilegedIntentsRequired as e:
+        print(f"[시작 오류] 개발자 포털에서 특권 인텐트가 꺼져 있습니다: {e}")
+        if os.getenv("NO_MESSAGE_CONTENT") != "1":
+            # MESSAGE CONTENT 만 끄고 다시 시작 (슬래시 명령어는 정상 동작, /바카라승률 숨김 명령만 비활성)
+            print("[시작 오류] MESSAGE CONTENT INTENT 없이 다시 시작합니다. (/바카라승률 비활성) "
+                  "→ 개발자 포털 Bot 탭에서 MESSAGE CONTENT INTENT 를 켜면 사용 가능합니다.")
+            import sys
+            os.environ["NO_MESSAGE_CONTENT"] = "1"
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        raise

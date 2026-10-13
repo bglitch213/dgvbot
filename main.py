@@ -336,6 +336,7 @@ def resync_voice_sessions_sync(entries, now):
 
 
 _last_guild_sync = {}  # guild_id -> 마지막 동기화 시각 (너무 잦은 동기화 방지)
+_rest_startup_done = False  # 시작 시 디스코드 API 작업을 이미 했는지
 
 
 BOT_VERSION = "2026-10-14 바카라 수정판"
@@ -375,15 +376,65 @@ _sync_status = {}           # guild.id -> 등록 결과 문자열 (시작 보고
 _startup_report_sent = False
 
 
-async def sync_guild_commands(guild: discord.Guild, min_interval: float = 0.0) -> bool:
-    """이 서버의 슬래시 명령어를 현재 코드 기준으로 디스코드에 덮어써서 맞춘다."""
+def get_meta_db(cur, key):
+    cur.execute("SELECT value FROM bot_meta WHERE key=%s", (key,))
+    r = cur.fetchone()
+    return r[0] if r else None
+
+
+def set_meta_db(cur, key, value):
+    cur.execute(
+        "INSERT INTO bot_meta (key, value) VALUES (%s, %s) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        (key, value),
+    )
+
+
+def commands_fingerprint():
+    """현재 코드의 슬래시 명령어 구성을 요약한 값 (바뀌지 않았으면 디스코드에 다시 등록하지 않기 위함)."""
+    import hashlib, json
+    try:
+        items = []
+        for c in bot.tree.get_commands():
+            try:
+                d = c.to_dict(bot.tree)
+            except TypeError:
+                d = c.to_dict()
+            items.append(d)
+        raw = json.dumps(items, sort_keys=True, ensure_ascii=False, default=str)
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    except Exception:
+        return None
+
+
+async def sync_guild_commands(guild: discord.Guild, min_interval: float = 0.0, force: bool = False) -> bool:
+    """이 서버의 슬래시 명령어를 현재 코드 기준으로 디스코드에 덮어써서 맞춘다.
+    명령어 구성이 지난번 등록 때와 같으면 디스코드 API 를 호출하지 않고 건너뛴다. (재시작 때 요청 제한 방지)"""
     now = time.time()
     if now - _last_guild_sync.get(guild.id, 0) < min_interval:
         return False
     _last_guild_sync[guild.id] = now
+
+    fp = commands_fingerprint()
+    meta_key = f"cmdhash:{guild.id}"
+    if not force and fp and os.getenv("FORCE_COMMAND_SYNC") != "1":
+        try:
+            if await run_db(get_meta_db, meta_key) == fp:
+                n = len(bot.tree.get_commands())
+                print(f"[COMMAND SYNC] {guild.name} ({guild.id}) 명령어 변경 없음 → 등록 생략", flush=True)
+                _sync_status[guild.id] = f"✅ {guild.name}: 명령어 {n}개 (변경 없음, 등록 생략)"
+                return True
+        except Exception as e:
+            print(f"[COMMAND SYNC] 지문 확인 실패(무시하고 등록 진행): {e}", flush=True)
+
     try:
         bot.tree.copy_global_to(guild=guild)
         synced = await bot.tree.sync(guild=guild)
+        if fp:
+            try:
+                await run_db(set_meta_db, meta_key, fp)
+            except Exception as e:
+                print(f"[COMMAND SYNC] 지문 저장 실패(무시): {e}", flush=True)
         names = ", ".join(c.name for c in synced)
         print(f"[COMMAND SYNC] {guild.name} ({guild.id}) -> {len(synced)}개: {names}")
         has_rank = any(c.name == "이용순위" for c in synced)
@@ -403,20 +454,28 @@ async def on_ready():
     global commands_synced
     print(f"로그인 완료: {bot.user}", flush=True)
 
-    # 예전 버전이 '전역'으로 등록해 둔 낡은 명령어가 서버 명령어와 겹쳐 보이는 것을 막기 위해
-    # 전역 등록분을 비움 (서버별 등록은 아래에서 따로 함)
-    try:
-        await bot.http.bulk_upsert_global_commands(bot.application_id, [])
-    except Exception as e:
-        print(f"[COMMAND SYNC] 전역 명령어 정리 실패(무시 가능): {e}")
+    # 디스코드 API 를 호출하는 시작 작업(명령어 등록/DM)은 프로세스당 1번만 한다.
+    # (연결이 끊겼다 다시 붙어 on_ready 가 또 불려도 반복하지 않음 → 디스코드 요청 제한 방지)
+    global _rest_startup_done
+    first_ready = not _rest_startup_done
+    _rest_startup_done = True
 
-    # 재연결로 on_ready 가 다시 불려도 매번 동기화 (서버별로 따로 처리 → 한 서버가 실패해도 계속 진행)
-    results = [await sync_guild_commands(guild) for guild in bot.guilds]
-    commands_synced = all(results)
+    if first_ready:
+        # 예전 버전이 '전역'으로 등록해 둔 낡은 명령어 정리는 DB 에 기록해서 딱 1번만 수행
+        try:
+            if await run_db(get_meta_db, "global_cleared") != "1":
+                await bot.http.bulk_upsert_global_commands(bot.application_id, [])
+                await run_db(set_meta_db, "global_cleared", "1")
+        except Exception as e:
+            print(f"[COMMAND SYNC] 전역 명령어 정리 실패(무시 가능): {e}", flush=True)
+
+        # 서버별로 따로 처리 → 한 서버가 실패해도 계속 진행. 명령어가 안 바뀌었으면 등록을 건너뜀
+        results = [await sync_guild_commands(guild) for guild in bot.guilds]
+        commands_synced = all(results)
 
     # 진단용: 봇 소유자에게 시작/명령어 등록 결과를 DM으로 1회 보고 (콘솔을 볼 수 없어도 확인 가능)
     global _startup_report_sent
-    if not _startup_report_sent:
+    if first_ready and not _startup_report_sent:
         _startup_report_sent = True
         try:
             version = await run_db(next_version_db)
@@ -433,6 +492,8 @@ async def on_ready():
 
     # 멤버 목록 불러오기 (오래 걸리거나 막혀도 위의 명령어 등록에는 영향 없도록 뒤로 이동 + 시간 제한)
     for guild in bot.guilds:
+        if guild.chunked:
+            continue
         try:
             await asyncio.wait_for(guild.chunk(cache=True), timeout=60)
         except Exception as e:
@@ -461,7 +522,7 @@ async def on_guild_join(guild: discord.Guild):
         await guild.chunk(cache=True)
     except Exception:
         pass
-    await sync_guild_commands(guild)
+    await sync_guild_commands(guild, force=True)
 
 
 # 모든 슬래시 명령어의 공통 오류 처리 (응답 없음 방지)
@@ -472,7 +533,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         print(f"[명령어 오류] 시그니처 불일치: {getattr(error.command, 'name', '?')} → 자동 재동기화 시도")
         fixed = False
         if interaction.guild is not None:
-            fixed = await sync_guild_commands(interaction.guild, min_interval=30)
+            fixed = await sync_guild_commands(interaction.guild, min_interval=30, force=True)
         if fixed:
             msg = ("🔄 명령어 정보가 오래돼서 방금 자동으로 갱신했습니다.\n"
                    "**디스코드 앱을 새로고침(Ctrl+R, 모바일은 앱 완전 종료 후 재실행)** 한 뒤 다시 입력해 주세요.")

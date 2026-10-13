@@ -154,6 +154,12 @@ def init_db():
                 baccarat_win_rate INTEGER DEFAULT NULL
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bot_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
         # 기존 테이블을 쓰는 경우에도 필요한 컬럼을 자동 보완
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT DEFAULT NULL")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT DEFAULT NULL")
@@ -333,6 +339,38 @@ _last_guild_sync = {}  # guild_id -> 마지막 동기화 시각 (너무 잦은 �
 
 
 BOT_VERSION = "2026-10-14 바카라 수정판"
+VERSION_CARRY = 20          # 각 자리가 20이 되면 앞자리로 올림
+
+
+def bump_version(v: str) -> str:
+    """0.0.1 -> 0.0.2 ... 0.0.19 -> 0.1.0 ... 0.19.19 -> 1.0.0 (각 자리가 20이 되면 앞자리로 올림)"""
+    try:
+        a, b, c = (int(x) for x in v.split("."))
+    except Exception:
+        return "0.0.1"
+    c += 1
+    if c >= VERSION_CARRY:
+        c = 0
+        b += 1
+    if b >= VERSION_CARRY:
+        b = 0
+        a += 1
+    return f"{a}.{b}.{c}"
+
+
+def next_version_db(cur):
+    """봇이 시작될 때마다 1회 호출: 저장된 버전을 올려서 저장하고 반환 (처음이면 0.0.1)."""
+    cur.execute("SELECT value FROM bot_meta WHERE key='version' FOR UPDATE")
+    row = cur.fetchone()
+    new = bump_version(row[0]) if row and row[0] else "0.0.1"
+    cur.execute(
+        "INSERT INTO bot_meta (key, value) VALUES ('version', %s) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        (new,),
+    )
+    return new
+
+
 _sync_status = {}           # guild.id -> 등록 결과 문자열 (시작 보고 DM용)
 _startup_report_sent = False
 
@@ -381,10 +419,15 @@ async def on_ready():
     if not _startup_report_sent:
         _startup_report_sent = True
         try:
+            version = await run_db(next_version_db)
+        except Exception as e:
+            print(f"[버전 증가 실패] {e}", flush=True)
+            version = "확인 실패"
+        try:
             info = await bot.application_info()
             owner = info.team.owner if info.team else info.owner
             report = "\n".join(_sync_status.get(g.id, f"⚠️ {g.name}: 결과 없음") for g in bot.guilds) or "참여한 서버 없음"
-            await owner.send(f"🤖 **봇 시작 보고**\n실행 중인 코드 버전: `{BOT_VERSION}`\n{report}")
+            await owner.send(f"🤖 **봇 업데이트 알림**\n🆕 현재 버전: **v{version}**\n{report}")
         except Exception as e:
             print(f"[시작 보고 DM 실패] {e}")
 

@@ -5,6 +5,7 @@ import asyncio
 import random
 import threading
 from threading import Thread
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 
@@ -81,7 +82,12 @@ def db_cursor():
             yield cur
             conn.commit()
         except (psycopg2.OperationalError, psycopg2.InterfaceError):
-            broken = True
+            # 연결이 실제로 끊긴 경우에만 폐기 (데드락 등은 롤백 후 그대로 재사용)
+            try:
+                conn.rollback()
+                broken = bool(conn.closed)
+            except Exception:
+                broken = True
             raise
         except Exception:
             try:
@@ -115,8 +121,14 @@ def _run(fn, *args):
     raise last
 
 
+# DB 전용 스레드풀 (워커 수 = 커넥션 풀 크기).
+# 기본 to_thread 풀을 쓰면 커넥션을 기다리는 스레드가 다른 작업까지 막을 수 있어 분리했습니다.
+_db_executor = ThreadPoolExecutor(max_workers=POOL_MAX, thread_name_prefix="db")
+
+
 async def run_db(fn, *args):
-    return await asyncio.to_thread(_run, fn, *args)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_db_executor, _run, fn, *args)
 
 
 def init_db():
@@ -178,40 +190,76 @@ init_db()
 
 
 def ensure_user(cur, guild_id, user_id, username=None):
+    """유저 행이 없으면 만들고, 닉네임이 실제로 바뀐 경우에만 갱신 (불필요한 행 재작성 방지)."""
     cur.execute(
         """
         INSERT INTO users (guild_id, user_id, username, coins, voice_minutes, warnings, defense_tickets)
         VALUES (%s, %s, %s, 0, 0, 0, 0)
         ON CONFLICT (guild_id, user_id) DO UPDATE
-            SET username = COALESCE(EXCLUDED.username, users.username)
+            SET username = EXCLUDED.username
+            WHERE EXCLUDED.username IS NOT NULL
+              AND users.username IS DISTINCT FROM EXCLUDED.username
         """,
         (guild_id, user_id, username),
     )
 
 
 # ==========================================
+# 1-2. 서버 설정 캐시 (슬롯/바카라/음성 보상률을 매번 DB 에서 읽지 않도록)
+# ==========================================
+_SETTINGS_TTL = 15.0
+_SETTING_KEYS = ("voice_reward_rate", "referral_reward", "log_channel_id", "slot_rtp", "baccarat_win_rate")
+_SETTING_DEFAULTS = {
+    "voice_reward_rate": 1, "referral_reward": 30, "log_channel_id": None,
+    "slot_rtp": 85, "baccarat_win_rate": None,
+}
+_settings_cache = {}  # guild_id -> (만료 시각, {설정})
+
+
+def get_cached_setting(cur, guild_id, key):
+    now = time.monotonic()
+    hit = _settings_cache.get(guild_id)
+    if hit is None or hit[0] < now:
+        cur.execute(
+            "SELECT voice_reward_rate, referral_reward, log_channel_id, slot_rtp, baccarat_win_rate "
+            "FROM guild_settings WHERE guild_id=%s",
+            (guild_id,),
+        )
+        row = cur.fetchone()
+        data = dict(_SETTING_DEFAULTS)
+        if row:
+            for k, v in zip(_SETTING_KEYS, row):
+                if v is not None:
+                    data[k] = v
+        hit = (now + _SETTINGS_TTL, data)
+        _settings_cache[guild_id] = hit
+    return hit[1][key]
+
+
+def invalidate_settings(guild_id):
+    _settings_cache.pop(guild_id, None)
+
+
+# ==========================================
 # 2. 음성 시간 / 코인 적립 로직 (이벤트·1분 루프 공용)
+#    ※ 락 순서는 항상 voice_sessions → users 로 통일 (이벤트와 1분 루프 사이 데드락 방지)
 # ==========================================
 def award_voice(cur, guild_id, user_id, username, minutes):
     if minutes <= 0:
         return
-    cur.execute("SELECT voice_reward_rate FROM guild_settings WHERE guild_id=%s", (guild_id,))
-    rr = cur.fetchone()
-    rate = rr[0] if rr and rr[0] is not None else 1
-    cur.execute("SELECT COALESCE(voice_minutes, 0) FROM users WHERE guild_id=%s AND user_id=%s", (guild_id, user_id))
-    row = cur.fetchone()
-    previous = row[0] if row else 0
-    new_minutes = previous + minutes
-    crossed = new_minutes // VOICE_REWARD_INTERVAL_MINUTES - previous // VOICE_REWARD_INTERVAL_MINUTES
+    rate = int(get_cached_setting(cur, guild_id, "voice_reward_rate"))
+    N = VOICE_REWARD_INTERVAL_MINUTES
+    # 조회 + 계산 + 갱신을 SQL 한 번으로 처리 (정수 나눗셈 = 파이썬 // 와 동일)
     cur.execute(
-        """
+        f"""
         UPDATE users
-        SET voice_minutes = COALESCE(voice_minutes, 0) + %s,
-            coins = COALESCE(coins, 0) + %s,
+        SET coins = COALESCE(coins, 0)
+                    + ((COALESCE(voice_minutes, 0) + %s) / {N} - COALESCE(voice_minutes, 0) / {N}) * %s,
+            voice_minutes = COALESCE(voice_minutes, 0) + %s,
             username = COALESCE(%s, username)
         WHERE guild_id=%s AND user_id=%s
         """,
-        (minutes, crossed * rate, username, guild_id, user_id),
+        (minutes, rate, minutes, username, guild_id, user_id),
     )
 
 
@@ -222,8 +270,6 @@ def process_voice(cur, guild_id, user_id, username, in_voice, muted, now, fresh_
     - fresh_join=True: 새로 입장 (기존 잔여 세션 초기화)
     - 그 외          : 지금까지 카운트된 시간을 정산하고 뮤트 상태에 맞춰 카운트 재개/중지
     """
-    ensure_user(cur, guild_id, user_id, username)
-
     if fresh_join:
         cur.execute(
             """
@@ -236,6 +282,7 @@ def process_voice(cur, guild_id, user_id, username, in_voice, muted, now, fresh_
             """,
             (guild_id, user_id, now, None if muted else now),
         )
+        ensure_user(cur, guild_id, user_id, username)
         return
 
     cur.execute(
@@ -253,7 +300,10 @@ def process_voice(cur, guild_id, user_id, username, in_voice, muted, now, fresh_
             acc = float(acc)
             if counting_since is not None:
                 acc += max(0, now - float(counting_since))
-            award_voice(cur, guild_id, user_id, username, int(acc // 60))
+            minutes = int(acc // 60)
+            if minutes > 0:
+                ensure_user(cur, guild_id, user_id, username)
+                award_voice(cur, guild_id, user_id, username, minutes)
             cur.execute("DELETE FROM voice_sessions WHERE guild_id=%s AND user_id=%s", (guild_id, user_id))
         return
 
@@ -266,6 +316,7 @@ def process_voice(cur, guild_id, user_id, username, in_voice, muted, now, fresh_
             """,
             (guild_id, user_id, now, None if muted else now),
         )
+        ensure_user(cur, guild_id, user_id, username)
         return
 
     counting_since, acc = row
@@ -274,7 +325,9 @@ def process_voice(cur, guild_id, user_id, username, in_voice, muted, now, fresh_
         acc += max(0, now - float(counting_since))
     minutes = int(acc // 60)
     acc -= minutes * 60
-    award_voice(cur, guild_id, user_id, username, minutes)
+    if minutes > 0:
+        ensure_user(cur, guild_id, user_id, username)
+        award_voice(cur, guild_id, user_id, username, minutes)
     cur.execute(
         """
         UPDATE voice_sessions SET counting_since=%s, accumulated_seconds=%s
@@ -289,26 +342,103 @@ def fetch_sessions(cur):
     return cur.fetchall()
 
 
-def voice_batch(items, now):
-    for guild_id, user_id, username, in_voice, muted in items:
-        try:
-            _run(process_voice, guild_id, user_id, username, in_voice, muted, now)
-        except Exception as e:
-            print(f"[VOICE DEBUG] 사용자 처리 오류 ({guild_id}/{user_id}): {e}")
+VOICE_CHUNK = 300  # 1분 정산 시 한 트랜잭션에서 처리할 인원 수
+
+
+def settle_voice_chunk(cur, chunk, now):
+    """
+    1분 정산을 '인원 수만큼 쿼리'가 아니라 '묶음당 쿼리 3~4개'로 처리한다.
+    chunk: [(guild_id, user_id, username, in_voice, muted), ...]
+    이벤트 처리 중인 세션은 SKIP LOCKED 로 건너뛰고 다음 분에 정산한다. (시간은 사라지지 않고 누적됨)
+    """
+    keys = tuple((g, u) for g, u, _, _, _ in chunk)
+    cur.execute(
+        """
+        SELECT guild_id, user_id, counting_since, COALESCE(accumulated_seconds, 0), join_time
+        FROM voice_sessions
+        WHERE (guild_id, user_id) IN %s
+        ORDER BY guild_id, user_id
+        FOR UPDATE SKIP LOCKED
+        """,
+        (keys,),
+    )
+    sessions = {(g, u): (cs, float(acc), jt) for g, u, cs, acc, jt in cur.fetchall()}
+
+    user_rows, sess_rows, drop_keys = [], [], []
+    for g, u, name, in_voice, muted in chunk:
+        s = sessions.get((g, u))
+        if s is None:
+            continue  # 이벤트가 처리 중이거나 이미 삭제된 세션
+        cs, acc, jt = s
+        if jt is not None and float(jt) > now:
+            continue  # 이번 정산 계산 이후에 새로 입장한 세션
+        if cs is not None:
+            if float(cs) > now:
+                continue  # 이번 정산 이후에 이벤트가 갱신한 세션
+            acc += max(0.0, now - float(cs))
+        minutes = int(acc // 60)
+        if minutes > 0:
+            rate = int(get_cached_setting(cur, g, "voice_reward_rate"))
+            user_rows.append((g, u, minutes, rate, name))
+        if not in_voice:
+            drop_keys.append((g, u))
+        else:
+            acc -= minutes * 60
+            if muted and cs is None and minutes == 0:
+                continue  # 뮤트 상태 유지 중 → 바뀐 게 없으니 쓰지 않음
+            sess_rows.append((g, u, None if muted else now, acc))
+
+    N = VOICE_REWARD_INTERVAL_MINUTES
+    if user_rows:
+        execute_values(
+            cur,
+            f"""
+            UPDATE users AS u SET
+                coins = COALESCE(u.coins, 0)
+                        + ((COALESCE(u.voice_minutes, 0) + v.m) / {N} - COALESCE(u.voice_minutes, 0) / {N}) * v.rate,
+                voice_minutes = COALESCE(u.voice_minutes, 0) + v.m,
+                username = COALESCE(v.name, u.username)
+            FROM (VALUES %s) AS v(guild_id, user_id, m, rate, name)
+            WHERE u.guild_id = v.guild_id AND u.user_id = v.user_id
+            """,
+            user_rows,
+            template="(%s::bigint, %s::bigint, %s::int, %s::int, %s::text)",
+            page_size=500,
+        )
+    if sess_rows:
+        execute_values(
+            cur,
+            """
+            UPDATE voice_sessions AS s SET
+                counting_since = v.cs,
+                accumulated_seconds = v.acc
+            FROM (VALUES %s) AS v(guild_id, user_id, cs, acc)
+            WHERE s.guild_id = v.guild_id AND s.user_id = v.user_id
+            """,
+            sess_rows,
+            template="(%s::bigint, %s::bigint, %s::double precision, %s::double precision)",
+            page_size=500,
+        )
+    if drop_keys:
+        cur.execute("DELETE FROM voice_sessions WHERE (guild_id, user_id) IN %s", (tuple(drop_keys),))
 
 
 # ==========================================
 # 3. 봇 설정
 # ==========================================
-intents = discord.Intents.default()
+# 필요한 이벤트만 받도록 최소 인텐트 사용 (typing/reaction/emoji 등 불필요한 게이트웨이 이벤트 제거)
+intents = discord.Intents.none()
 intents.guilds = True
 intents.voice_states = True
 intents.members = True  # 개발자 포털에서 SERVER MEMBERS INTENT 를 반드시 켜야 합니다.
 # 숨김 명령어(/바카라승률) 용. 개발자 포털에서 MESSAGE CONTENT INTENT 를 켜야 합니다.
 # (꺼져 있으면 아래 시작부에서 자동으로 이 기능만 끄고 봇은 정상 시작합니다.)
 intents.message_content = os.getenv("NO_MESSAGE_CONTENT") != "1"
+intents.guild_messages = intents.message_content   # 서버 채팅 이벤트는 숨김 명령어에만 필요
+intents.dm_messages = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+# max_messages=None : 메시지 캐시 불필요 (메모리/CPU 절약)
+bot = commands.Bot(command_prefix="!", intents=intents, max_messages=None)
 commands_synced = False
 
 
@@ -316,21 +446,35 @@ def voice_is_muted(voice_state) -> bool:
     return bool(voice_state and (voice_state.self_mute or voice_state.self_deaf))
 
 
-def resync_voice_sessions_sync(entries, now):
-    """봇 (재)시작 시 이미 음성 채널에 있는 유저의 세션을 만들어 줌."""
-    for guild_id, user_id, username, muted in entries:
+def _resync_chunk(cur, chunk, now):
+    execute_values(
+        cur,
+        """
+        INSERT INTO users (guild_id, user_id, username, coins, voice_minutes, warnings, defense_tickets)
+        VALUES %s
+        ON CONFLICT (guild_id, user_id) DO UPDATE SET username = EXCLUDED.username
+        WHERE EXCLUDED.username IS NOT NULL AND users.username IS DISTINCT FROM EXCLUDED.username
+        """,
+        [(g, u, name, 0, 0, 0, 0) for g, u, name, _ in chunk],
+        page_size=500,
+    )
+    execute_values(
+        cur,
+        """
+        INSERT INTO voice_sessions (guild_id, user_id, join_time, counting_since, accumulated_seconds)
+        VALUES %s
+        ON CONFLICT (guild_id, user_id) DO NOTHING
+        """,
+        [(g, u, now, None if muted else now, 0) for g, u, _, muted in chunk],
+        page_size=500,
+    )
+
+
+async def resync_voice_sessions(entries, now):
+    """봇 (재)시작 시 이미 음성 채널에 있는 유저의 세션을 묶음 단위로 만들어 줌."""
+    for i in range(0, len(entries), 500):
         try:
-            def _f(cur):
-                ensure_user(cur, guild_id, user_id, username)
-                cur.execute(
-                    """
-                    INSERT INTO voice_sessions (guild_id, user_id, join_time, counting_since, accumulated_seconds)
-                    VALUES (%s, %s, %s, %s, 0)
-                    ON CONFLICT (guild_id, user_id) DO NOTHING
-                    """,
-                    (guild_id, user_id, now, None if muted else now),
-                )
-            _run(_f)
+            await run_db(_resync_chunk, entries[i:i + 500], now)
         except Exception as e:
             print(f"[VOICE DEBUG] 세션 복구 오류: {e}")
 
@@ -339,7 +483,7 @@ _last_guild_sync = {}  # guild_id -> 마지막 동기화 시각 (너무 잦은 �
 _rest_startup_done = False  # 시작 시 디스코드 API 작업을 이미 했는지
 
 
-BOT_VERSION = "2026-10-14 바카라 수정판"
+BOT_VERSION = "2026-10-14 대규모 서버 최적화판"
 VERSION_CARRY = 20          # 각 자리가 20이 되면 앞자리로 올림
 
 
@@ -508,7 +652,7 @@ async def on_ready():
                     if not m.bot:
                         entries.append((guild.id, m.id, m.name, voice_is_muted(m.voice)))
         if entries:
-            await asyncio.to_thread(resync_voice_sessions_sync, entries, time.time())
+            await resync_voice_sessions(entries, time.time())
     except Exception as e:
         print(f"[VOICE DEBUG] 세션 복구 실패: {e}")
 
@@ -562,6 +706,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 @tasks.loop(minutes=1)
 async def check_voice_time():
     try:
+        started = time.time()
         sessions = await run_db(fetch_sessions)
         items = []
         for guild_id, user_id in sessions:
@@ -574,8 +719,12 @@ async def check_voice_time():
             muted = voice_is_muted(voice)
             username = member.name if member else None
             items.append((int(guild_id), int(user_id), username, in_voice, muted))
-        if items:
-            await asyncio.to_thread(voice_batch, items, time.time())
+        # 묶음(300명)마다 한 트랜잭션 → 1200명이어도 쿼리 십수 개로 끝남
+        for i in range(0, len(items), VOICE_CHUNK):
+            try:
+                await run_db(settle_voice_chunk, items[i:i + VOICE_CHUNK], started)
+            except Exception as e:
+                print(f"[VOICE DEBUG] 묶음 정산 오류: {e}")
     except Exception as e:
         print(f"[VOICE DEBUG] 전체 음성 체크 오류: {e}")
 
@@ -593,6 +742,10 @@ async def on_voice_state_update(member, before, after):
     was_connected = before.channel is not None
     is_connected = after.channel is not None
     muted_after = voice_is_muted(after)
+
+    # 입장/퇴장/뮤트 상태가 바뀐 경우만 처리. (채널 이동·화면공유·카메라 토글 등은 시간 계산에 영향 없음)
+    if was_connected == is_connected and voice_is_muted(before) == muted_after:
+        return
 
     try:
         await run_db(
@@ -790,6 +943,7 @@ def set_log_channel_db(cur, guild_id, channel_id):
         """,
         (guild_id, channel_id),
     )
+    invalidate_settings(guild_id)
 
 
 def get_log_channel_db(cur, guild_id):
@@ -1171,36 +1325,25 @@ def roll_slot_result(rtp_percent: int):
 
 
 def play_slot_db(cur, guild_id, user_id, bet):
-    """베팅 차감 → 결과 → 지급을 하나의 트랜잭션으로 처리 (중간 오류 시 코인 손실 없음)."""
-    ensure_user(cur, guild_id, user_id)
+    """결과를 먼저 계산하고, 베팅 차감+지급을 UPDATE 한 번(원자적)으로 처리. 코인 부족이면 변동 없음."""
+    rtp = int(get_cached_setting(cur, guild_id, "slot_rtp"))
+    icons, multiplier = roll_slot_result(rtp)
+    payout = int(bet * multiplier)
+
     cur.execute(
         """
-        UPDATE users SET coins = coins - %s
+        UPDATE users SET coins = COALESCE(coins, 0) - %s + %s
         WHERE guild_id=%s AND user_id=%s AND COALESCE(coins, 0) >= %s
         RETURNING coins
         """,
-        (bet, guild_id, user_id, bet),
+        (bet, payout, guild_id, user_id, bet),
     )
     row = cur.fetchone()
     if row is None:
         cur.execute("SELECT COALESCE(coins, 0) FROM users WHERE guild_id=%s AND user_id=%s", (guild_id, user_id))
         r = cur.fetchone()
         return {"ok": False, "coins": int(r[0]) if r else 0}
-
-    cur.execute("SELECT slot_rtp FROM guild_settings WHERE guild_id=%s", (guild_id,))
-    r = cur.fetchone()
-    rtp = int(r[0]) if r and r[0] is not None else 85
-
-    icons, multiplier = roll_slot_result(rtp)
-    payout = int(bet * multiplier)
-    balance = int(row[0])
-    if payout > 0:
-        cur.execute(
-            "UPDATE users SET coins = coins + %s WHERE guild_id=%s AND user_id=%s RETURNING coins",
-            (payout, guild_id, user_id),
-        )
-        balance = int(cur.fetchone()[0])
-    return {"ok": True, "icons": icons, "multiplier": multiplier, "payout": payout, "coins": balance}
+    return {"ok": True, "icons": icons, "multiplier": multiplier, "payout": payout, "coins": int(row[0])}
 
 
 def build_slot_text(res, bet):
@@ -1222,16 +1365,16 @@ def build_slot_text(res, bet):
 
 
 class SlotMachineView(discord.ui.View):
-    def __init__(self, author_id: int, bet_amount: int):
+    def __init__(self, author_id: int, bet_amount: int, interaction: discord.Interaction = None):
         super().__init__(timeout=30)
         self.author_id = author_id
         self.bet_amount = bet_amount
-        self.message = None
+        self.interaction = interaction  # 메시지 수정은 '인터랙션 토큰'으로 (채널 요청 제한/전역 제한에 안 걸림)
 
     async def on_timeout(self):
-        if self.message is not None:
+        if self.interaction is not None:
             try:
-                await self.message.edit(view=None)
+                await self.interaction.edit_original_response(view=None)
             except Exception:
                 pass
 
@@ -1252,23 +1395,21 @@ class SlotMachineView(discord.ui.View):
 
         active_slot_spins.add(spin_key)
         self.stop()  # 이전 뷰의 타임아웃이 새 뷰를 지우지 않도록 중지
-        msg = interaction.message
         try:
             await interaction.response.edit_message(content="🎰 **슬롯머신이 돌아가는 중입니다...**\n` 🔄 | 🔄 | 🔄 `", view=None)
 
             async with slot_semaphore:
                 res = await run_db(play_slot_db, guild_id, user_id, self.bet_amount)
-                if not res["ok"]:
-                    await msg.edit(content=f"❌ 코인이 부족합니다! (현재 잔액: {res['coins']:,}코인)", view=None)
-                    return
-                await asyncio.sleep(0.6)
-                new_view = SlotMachineView(self.author_id, self.bet_amount)
-                new_view.message = msg
-                await msg.edit(content=build_slot_text(res, self.bet_amount), view=new_view)
+            if not res["ok"]:
+                await interaction.edit_original_response(content=f"❌ 코인이 부족합니다! (현재 잔액: {res['coins']:,}코인)", view=None)
+                return
+            await asyncio.sleep(0.6)
+            new_view = SlotMachineView(self.author_id, self.bet_amount, interaction)
+            await interaction.edit_original_response(content=build_slot_text(res, self.bet_amount), view=new_view)
         except Exception as e:
             print(f"[슬롯 오류] {e}")
             try:
-                await msg.edit(content=f"❌ 슬롯머신 처리 중 오류가 발생했습니다: {str(e)[:200]}", view=None)
+                await interaction.edit_original_response(content=f"❌ 슬롯머신 처리 중 오류가 발생했습니다: {str(e)[:200]}", view=None)
             except Exception:
                 pass
         finally:
@@ -1292,25 +1433,21 @@ async def slot_machine(interaction: discord.Interaction, bet: int):
         return
 
     active_slot_spins.add(spin_key)
-    msg = None
     try:
         await interaction.response.send_message("🎰 **슬롯머신이 돌아가는 중입니다...**\n` 🔄 | 🔄 | 🔄 `")
-        msg = await interaction.original_response()
 
         async with slot_semaphore:
             res = await run_db(play_slot_db, guild_id, user_id, bet)
-            if not res["ok"]:
-                await msg.edit(content=f"❌ 코인이 부족합니다! (현재 잔액: {res['coins']:,}코인)")
-                return
-            await asyncio.sleep(0.6)
-            view = SlotMachineView(user_id, bet)
-            view.message = msg
-            await msg.edit(content=build_slot_text(res, bet), view=view)
+        if not res["ok"]:
+            await interaction.edit_original_response(content=f"❌ 코인이 부족합니다! (현재 잔액: {res['coins']:,}코인)")
+            return
+        await asyncio.sleep(0.6)
+        view = SlotMachineView(user_id, bet, interaction)
+        await interaction.edit_original_response(content=build_slot_text(res, bet), view=view)
     except Exception as e:
         print(f"[슬롯 오류] {e}")
         try:
-            if msg is not None:
-                await msg.edit(content=f"❌ 슬롯머신 처리 중 오류가 발생했습니다: {str(e)[:200]}", view=None)
+            await interaction.edit_original_response(content=f"❌ 슬롯머신 처리 중 오류가 발생했습니다: {str(e)[:200]}", view=None)
         except Exception:
             pass
     finally:
@@ -1416,35 +1553,26 @@ def baccarat_payout(choice: str, winner: str, bet: int) -> int:
 
 
 def play_baccarat_db(cur, guild_id, user_id, bet, choice):
-    """배팅 차감 → 카드 진행 → 지급을 하나의 트랜잭션으로 처리 (중간 오류 시 코인 손실 없음)."""
-    ensure_user(cur, guild_id, user_id)
+    """결과를 먼저 계산하고, 베팅 차감+지급을 UPDATE 한 번(원자적)으로 처리. 코인 부족이면 변동 없음."""
+    win_rate = get_cached_setting(cur, guild_id, "baccarat_win_rate")
+    win_rate = int(win_rate) if win_rate is not None else None
+    hand = deal_baccarat_rigged(choice, win_rate)
+    payout = baccarat_payout(choice, hand["winner"], bet)
+
     cur.execute(
         """
-        UPDATE users SET coins = coins - %s
+        UPDATE users SET coins = COALESCE(coins, 0) - %s + %s
         WHERE guild_id=%s AND user_id=%s AND COALESCE(coins, 0) >= %s
         RETURNING coins
         """,
-        (bet, guild_id, user_id, bet),
+        (bet, payout, guild_id, user_id, bet),
     )
     row = cur.fetchone()
     if row is None:
         cur.execute("SELECT COALESCE(coins, 0) FROM users WHERE guild_id=%s AND user_id=%s", (guild_id, user_id))
         r = cur.fetchone()
         return {"ok": False, "coins": int(r[0]) if r else 0}
-
-    cur.execute("SELECT baccarat_win_rate FROM guild_settings WHERE guild_id=%s", (guild_id,))
-    wr = cur.fetchone()
-    win_rate = int(wr[0]) if wr and wr[0] is not None else None
-    hand = deal_baccarat_rigged(choice, win_rate)
-    payout = baccarat_payout(choice, hand["winner"], bet)
-    balance = int(row[0])
-    if payout > 0:
-        cur.execute(
-            "UPDATE users SET coins = coins + %s WHERE guild_id=%s AND user_id=%s RETURNING coins",
-            (payout, guild_id, user_id),
-        )
-        balance = int(cur.fetchone()[0])
-    return {"ok": True, **hand, "payout": payout, "coins": balance}
+    return {"ok": True, **hand, "payout": payout, "coins": int(row[0])}
 
 
 def _fmt_hand(hand) -> str:
@@ -1474,17 +1602,17 @@ def build_baccarat_text(res, bet: int, choice: str) -> str:
 
 
 class BaccaratView(discord.ui.View):
-    def __init__(self, author_id: int, bet_amount: int):
+    def __init__(self, author_id: int, bet_amount: int, interaction: discord.Interaction = None):
         super().__init__(timeout=60)
         self.author_id = author_id
         self.bet_amount = bet_amount
-        self.message = None
+        self.interaction = interaction  # 메시지 수정은 '인터랙션 토큰'으로 (채널 요청 제한/전역 제한에 안 걸림)
 
     async def on_timeout(self):
         baccarat_tables.discard(self)
-        if self.message is not None:
+        if self.interaction is not None:
             try:
-                await self.message.edit(view=None)
+                await self.interaction.edit_original_response(view=None)
             except Exception:
                 pass
 
@@ -1505,27 +1633,25 @@ class BaccaratView(discord.ui.View):
         active_baccarat.add(key)
         self.stop()  # 이전 뷰의 타임아웃이 새 뷰를 지우지 않도록 중지
         baccarat_tables.discard(self)  # 이 판의 자리는 결과가 나오면 새 뷰로 이어짐
-        msg = interaction.message
         try:
             await interaction.response.edit_message(content="🃏 **카드를 나누는 중입니다...**", view=None)
             async with baccarat_semaphore:
                 res = await run_db(play_baccarat_db, guild_id, user_id, self.bet_amount, choice)
-                if not res["ok"]:
-                    await msg.edit(content=f"❌ 코인이 부족합니다! (현재 잔액: {res['coins']:,}코인)", view=None)
-                    return
-                await asyncio.sleep(0.8)
-                new_view = BaccaratView(self.author_id, self.bet_amount)
-                new_view.message = msg
-                baccarat_tables.add(new_view)
-                try:
-                    await msg.edit(content=build_baccarat_text(res, self.bet_amount, choice), view=new_view)
-                except Exception:
-                    baccarat_tables.discard(new_view)
-                    raise
+            if not res["ok"]:
+                await interaction.edit_original_response(content=f"❌ 코인이 부족합니다! (현재 잔액: {res['coins']:,}코인)", view=None)
+                return
+            await asyncio.sleep(0.8)
+            new_view = BaccaratView(self.author_id, self.bet_amount, interaction)
+            baccarat_tables.add(new_view)
+            try:
+                await interaction.edit_original_response(content=build_baccarat_text(res, self.bet_amount, choice), view=new_view)
+            except Exception:
+                baccarat_tables.discard(new_view)
+                raise
         except Exception as e:
             print(f"[바카라 오류] {e}")
             try:
-                await msg.edit(content=f"❌ 바카라 처리 중 오류가 발생했습니다: {str(e)[:200]}", view=None)
+                await interaction.edit_original_response(content=f"❌ 바카라 처리 중 오류가 발생했습니다: {str(e)[:200]}", view=None)
             except Exception:
                 pass
         finally:
@@ -1554,12 +1680,16 @@ async def baccarat(interaction: discord.Interaction, bet: app_commands.Range[int
         await interaction.response.send_message("⏳ 이미 바카라가 진행 중입니다.", ephemeral=True)
         return
 
+    # 3초 안에 반드시 응답해야 하므로 사전 확인은 최대 2초만 기다림 (DB 가 느리면 건너뛰고, 버튼 클릭 시 다시 검사)
+    coins = None
     try:
-        coins = (await run_db(get_info_db, interaction.guild_id, interaction.user.id))[0]
+        coins = (await asyncio.wait_for(run_db(get_info_db, interaction.guild_id, interaction.user.id), timeout=2.0))[0]
+    except asyncio.TimeoutError:
+        coins = None
     except Exception as e:
         await interaction.response.send_message(f"❌ 오류: {e}", ephemeral=True)
         return
-    if coins < bet:
+    if coins is not None and coins < bet:
         await interaction.response.send_message(f"❌ 코인이 부족합니다! (현재 잔액: {coins:,}코인)", ephemeral=True)
         return
 
@@ -1567,9 +1697,9 @@ async def baccarat(interaction: discord.Interaction, bet: app_commands.Range[int
     for old in [v for v in baccarat_tables if v.author_id == interaction.user.id]:
         baccarat_tables.discard(old)
         old.stop()
-        if old.message is not None:
+        if old.interaction is not None:
             try:
-                await old.message.edit(view=None)
+                await old.interaction.edit_original_response(view=None)
             except Exception:
                 pass
 
@@ -1590,7 +1720,7 @@ async def baccarat(interaction: discord.Interaction, bet: app_commands.Range[int
             "• 🔵 플레이어 승 1:1\n• 🔴 뱅커 승 0.95:1 (수수료 5%)\n• 🟢 타이 8:1 (타이 시 플레이어·뱅커 배팅은 환불)",
             view=view,
         )
-        view.message = await interaction.original_response()
+        view.interaction = interaction  # original_response() 추가 API 호출 없이 인터랙션 토큰으로 수정
     except Exception:
         baccarat_tables.discard(view)
         raise
@@ -1796,6 +1926,7 @@ def set_slot_rtp_db(cur, guild_id, rtp):
         """,
         (guild_id, rtp),
     )
+    invalidate_settings(guild_id)
 
 
 def get_slot_rtp_db(cur, guild_id):
@@ -1840,6 +1971,7 @@ def set_baccarat_rate_db(cur, guild_id, rate):
         """,
         (guild_id, rate),
     )
+    invalidate_settings(guild_id)
 
 
 def get_baccarat_rate_db(cur, guild_id):
@@ -1853,7 +1985,8 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    m = BACCARAT_RATE_RE.match((message.content or "").strip())
+    content = (message.content or "").strip()
+    m = BACCARAT_RATE_RE.match(content) if content.startswith(("/바카라승률", "바카라승률")) else None
     if m:
         percent = int(m.group(1)) if m.group(1) is not None else None  # None = 현재 값만 조회
         # 대상 서버 결정 + 관리자 확인

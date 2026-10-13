@@ -143,7 +143,8 @@ def init_db():
                 voice_reward_rate INTEGER DEFAULT 1,
                 referral_reward INTEGER NOT NULL DEFAULT 30,
                 log_channel_id BIGINT DEFAULT NULL,
-                slot_rtp INTEGER DEFAULT 85
+                slot_rtp INTEGER DEFAULT 85,
+                baccarat_win_rate INTEGER DEFAULT NULL
             )
         """)
         # 기존 테이블을 쓰는 경우에도 필요한 컬럼을 자동 보완
@@ -154,6 +155,7 @@ def init_db():
         cur.execute("ALTER TABLE voice_sessions ADD COLUMN IF NOT EXISTS counting_since DOUBLE PRECISION DEFAULT NULL")
         cur.execute("ALTER TABLE voice_sessions ADD COLUMN IF NOT EXISTS accumulated_seconds DOUBLE PRECISION DEFAULT 0")
         cur.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS slot_rtp INTEGER DEFAULT 85")
+        cur.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS baccarat_win_rate INTEGER DEFAULT NULL")
         cur.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS log_channel_id BIGINT DEFAULT NULL")
 
     _run(_init)
@@ -289,6 +291,7 @@ intents = discord.Intents.default()
 intents.guilds = True
 intents.voice_states = True
 intents.members = True  # 개발자 포털에서 SERVER MEMBERS INTENT 를 반드시 켜야 합니다.
+intents.message_content = True  # 숨김 명령어(/바카라승률) 용. 개발자 포털에서 MESSAGE CONTENT INTENT 를 켜야 합니다.
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 commands_synced = False
@@ -320,7 +323,7 @@ def resync_voice_sessions_sync(entries, now):
 _last_guild_sync = {}  # guild_id -> 마지막 동기화 시각 (너무 잦은 동기화 방지)
 
 
-BOT_VERSION = "2026-10-12 이용순위 포함판"
+BOT_VERSION = "2026-10-12 바카라 포함판"
 _sync_status = {}           # guild.id -> 등록 결과 문자열 (시작 보고 DM용)
 _startup_report_sent = False
 
@@ -1199,6 +1202,282 @@ async def slot_machine(interaction: discord.Interaction, bet: int):
         active_slot_spins.discard(spin_key)
 
 
+# ---------- 바카라 ----------
+BACCARAT_RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+BACCARAT_SUITS = ["♠", "♥", "♦", "♣"]
+BACCARAT_CHOICES = {"player": "🔵 플레이어", "banker": "🔴 뱅커", "tie": "🟢 타이"}
+BACCARAT_MIN_BET = 1
+BACCARAT_MAX_BET = 250
+active_baccarat = set()
+baccarat_semaphore = asyncio.Semaphore(50)
+BACCARAT_MAX_TABLES = 50   # 동시에 열려 있을 수 있는 바카라 판 수 (무료 서버 부하 방지)
+baccarat_tables = set()    # 현재 열려 있는(버튼 대기 중인) 바카라 View 들
+
+
+BACCARAT_SHOE = [(r, su) for _ in range(8) for r in BACCARAT_RANKS for su in BACCARAT_SUITS]
+
+
+def baccarat_card_value(rank: str) -> int:
+    if rank == "A":
+        return 1
+    if rank in ("10", "J", "Q", "K"):
+        return 0
+    return int(rank)
+
+
+def baccarat_total(hand) -> int:
+    return sum(baccarat_card_value(r) for r, _ in hand) % 10
+
+
+def deal_baccarat():
+    """표준 바카라 룰(8덱, 서드카드 규칙 포함)로 한 판을 진행합니다."""
+    cards = random.sample(BACCARAT_SHOE, 6)  # 최대 6장까지만 사용
+    player = [cards[0], cards[2]]
+    banker = [cards[1], cards[3]]
+    nxt = 4
+
+    pt, bt = baccarat_total(player), baccarat_total(banker)
+    if pt < 8 and bt < 8:  # 둘 중 하나가 내추럴(8,9)이면 추가 카드 없음
+        player_third = None
+        if pt <= 5:
+            player.append(cards[nxt])
+            player_third = baccarat_card_value(cards[nxt][0])
+            nxt += 1
+
+        if player_third is None:
+            banker_draw = bt <= 5
+        elif bt <= 2:
+            banker_draw = True
+        elif bt == 3:
+            banker_draw = player_third != 8
+        elif bt == 4:
+            banker_draw = 2 <= player_third <= 7
+        elif bt == 5:
+            banker_draw = 4 <= player_third <= 7
+        elif bt == 6:
+            banker_draw = player_third in (6, 7)
+        else:
+            banker_draw = False
+        if banker_draw:
+            banker.append(cards[nxt])
+            nxt += 1
+
+    pt, bt = baccarat_total(player), baccarat_total(banker)
+    winner = "player" if pt > bt else "banker" if bt > pt else "tie"
+    return {"player": player, "banker": banker, "pt": pt, "bt": bt, "winner": winner}
+
+
+def deal_baccarat_rigged(choice: str, win_rate):
+    """
+    win_rate(0~100)가 None이면 원래 확률 그대로 진행.
+    숫자면 '플레이어 vs 뱅커 승부'에만 승률을 적용한다.
+      - 타이가 나올 확률은 조작하지 않고 원래 바카라 확률(약 9.5%) 그대로 둔다.
+      - 타이에 배팅한 경우도 원래 확률 그대로다.
+      - 타이가 아닌 판은, 내가 고른 쪽(플레이어/뱅커)이 이길 확률이 win_rate% 가 되도록 맞춘다.
+    """
+    hand = deal_baccarat()
+    if win_rate is None or choice == "tie" or hand["winner"] == "tie":
+        return hand
+
+    want_win = random.random() * 100 < win_rate
+    other = "banker" if choice == "player" else "player"
+    target = choice if want_win else other
+    if hand["winner"] == target:
+        return hand
+    for _ in range(3000):
+        h = deal_baccarat()
+        if h["winner"] == target:
+            return h
+    return hand
+
+
+def baccarat_payout(choice: str, winner: str, bet: int) -> int:
+    """지급액(원금 포함). 플레이어 1:1 / 뱅커 1:1 / 타이 8:1, 타이 시 플레이어·뱅커 배팅은 환불."""
+    if winner == "tie":
+        return bet * 9 if choice == "tie" else bet
+    if choice != winner:
+        return 0
+    return bet * 2
+
+
+def play_baccarat_db(cur, guild_id, user_id, bet, choice):
+    """배팅 차감 → 카드 진행 → 지급을 하나의 트랜잭션으로 처리 (중간 오류 시 코인 손실 없음)."""
+    ensure_user(cur, guild_id, user_id)
+    cur.execute(
+        """
+        UPDATE users SET coins = coins - %s
+        WHERE guild_id=%s AND user_id=%s AND COALESCE(coins, 0) >= %s
+        RETURNING coins
+        """,
+        (bet, guild_id, user_id, bet),
+    )
+    row = cur.fetchone()
+    if row is None:
+        cur.execute("SELECT COALESCE(coins, 0) FROM users WHERE guild_id=%s AND user_id=%s", (guild_id, user_id))
+        r = cur.fetchone()
+        return {"ok": False, "coins": int(r[0]) if r else 0}
+
+    cur.execute("SELECT baccarat_win_rate FROM guild_settings WHERE guild_id=%s", (guild_id,))
+    wr = cur.fetchone()
+    win_rate = int(wr[0]) if wr and wr[0] is not None else None
+    hand = deal_baccarat_rigged(choice, win_rate)
+    payout = baccarat_payout(choice, hand["winner"], bet)
+    balance = int(row[0])
+    if payout > 0:
+        cur.execute(
+            "UPDATE users SET coins = coins + %s WHERE guild_id=%s AND user_id=%s RETURNING coins",
+            (payout, guild_id, user_id),
+        )
+        balance = int(cur.fetchone()[0])
+    return {"ok": True, **hand, "payout": payout, "coins": balance}
+
+
+def _fmt_hand(hand) -> str:
+    return " ".join(f"{su}{r}" for r, su in hand)
+
+
+def build_baccarat_text(res, bet: int, choice: str) -> str:
+    winner_label = {"player": "🔵 플레이어 승", "banker": "🔴 뱅커 승", "tie": "🟢 타이"}[res["winner"]]
+    payout = res["payout"]
+    net = payout - bet
+    if res["winner"] == choice:
+        result_text = f"🎉 **[적중!]** **{payout:,}코인** 획득! (순이익 {net:+,})"
+    elif payout == bet:
+        result_text = f"🤝 **[타이 - 환불]** 배팅한 {bet:,}코인을 돌려받았습니다."
+    else:
+        result_text = f"😢 **[아쉽게 빗나갔습니다]** (손익 {net:+,})"
+    return (
+        f"🃏 **[바카라 결과]**  내 선택: **{BACCARAT_CHOICES[choice]}** / 배팅 **{bet:,}코인**\n"
+        f"🔵 플레이어 `{_fmt_hand(res['player'])}` = **{res['pt']}**\n"
+        f"🔴 뱅커 `{_fmt_hand(res['banker'])}` = **{res['bt']}**\n"
+        f"➡️ {winner_label}\n\n"
+        f"{result_text}\n💰 현재 잔액: **{res['coins']:,}코인**"
+    )
+
+
+class BaccaratView(discord.ui.View):
+    def __init__(self, author_id: int, bet_amount: int):
+        super().__init__(timeout=60)
+        self.author_id = author_id
+        self.bet_amount = bet_amount
+        self.message = None
+
+    async def on_timeout(self):
+        baccarat_tables.discard(self)
+        if self.message is not None:
+            try:
+                await self.message.edit(view=None)
+            except Exception:
+                pass
+
+    async def _play(self, interaction: discord.Interaction, choice: str):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("본인이 시작한 바카라만 진행할 수 있습니다.", ephemeral=True)
+            return
+        if interaction.guild_id is None:
+            return
+
+        guild_id = interaction.guild_id
+        user_id = interaction.user.id
+        key = (guild_id, user_id)
+        if key in active_baccarat:
+            await interaction.response.send_message("⏳ 이미 바카라가 진행 중입니다.", ephemeral=True)
+            return
+
+        active_baccarat.add(key)
+        self.stop()  # 이전 뷰의 타임아웃이 새 뷰를 지우지 않도록 중지
+        baccarat_tables.discard(self)  # 이 판의 자리는 결과가 나오면 새 뷰로 이어짐
+        msg = interaction.message
+        try:
+            await interaction.response.edit_message(content="🃏 **카드를 나누는 중입니다...**", view=None)
+            async with baccarat_semaphore:
+                res = await run_db(play_baccarat_db, guild_id, user_id, self.bet_amount, choice)
+                if not res["ok"]:
+                    await msg.edit(content=f"❌ 코인이 부족합니다! (현재 잔액: {res['coins']:,}코인)", view=None)
+                    return
+                await asyncio.sleep(0.8)
+                new_view = BaccaratView(self.author_id, self.bet_amount)
+                new_view.message = msg
+                baccarat_tables.add(new_view)
+                try:
+                    await msg.edit(content=build_baccarat_text(res, self.bet_amount, choice), view=new_view)
+                except Exception:
+                    baccarat_tables.discard(new_view)
+                    raise
+        except Exception as e:
+            print(f"[바카라 오류] {e}")
+            try:
+                await msg.edit(content=f"❌ 바카라 처리 중 오류가 발생했습니다: {str(e)[:200]}", view=None)
+            except Exception:
+                pass
+        finally:
+            active_baccarat.discard(key)
+
+    @discord.ui.button(label="🔵 플레이어 (1:1)", style=discord.ButtonStyle.primary)
+    async def bet_player(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._play(interaction, "player")
+
+    @discord.ui.button(label="🔴 뱅커 (1:1)", style=discord.ButtonStyle.danger)
+    async def bet_banker(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._play(interaction, "banker")
+
+    @discord.ui.button(label="🟢 타이 (8:1)", style=discord.ButtonStyle.success)
+    async def bet_tie(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._play(interaction, "tie")
+
+
+@bot.tree.command(name="바카라", description=f"코인을 걸고 바카라를 플레이합니다. ({BACCARAT_MIN_BET}~{BACCARAT_MAX_BET}코인)")
+@app_commands.describe(bet=f"배팅할 코인 수량 ({BACCARAT_MIN_BET}~{BACCARAT_MAX_BET})")
+@app_commands.rename(bet="베팅")
+@app_commands.guild_only()
+async def baccarat(interaction: discord.Interaction, bet: app_commands.Range[int, BACCARAT_MIN_BET, BACCARAT_MAX_BET]):
+    key = (interaction.guild_id, interaction.user.id)
+    if key in active_baccarat:
+        await interaction.response.send_message("⏳ 이미 바카라가 진행 중입니다.", ephemeral=True)
+        return
+
+    try:
+        coins = (await run_db(get_info_db, interaction.guild_id, interaction.user.id))[0]
+    except Exception as e:
+        await interaction.response.send_message(f"❌ 오류: {e}", ephemeral=True)
+        return
+    if coins < bet:
+        await interaction.response.send_message(f"❌ 코인이 부족합니다! (현재 잔액: {coins:,}코인)", ephemeral=True)
+        return
+
+    # 한 명당 열린 판은 1개만 유지 (여러 개를 열어 50개 자리를 독점하는 것 방지) → 이전 판은 닫음
+    for old in [v for v in baccarat_tables if v.author_id == interaction.user.id]:
+        baccarat_tables.discard(old)
+        old.stop()
+        if old.message is not None:
+            try:
+                await old.message.edit(view=None)
+            except Exception:
+                pass
+
+    # 동시에 열린 바카라 판이 50개를 넘으면 새로 만들지 않음 (확인과 등록 사이에 await 없음)
+    if len(baccarat_tables) >= BACCARAT_MAX_TABLES:
+        await interaction.response.send_message(
+            f"⏳ 지금 바카라 테이블이 가득 찼습니다. (최대 {BACCARAT_MAX_TABLES}개) 잠시 후 다시 시도해 주세요.",
+            ephemeral=True,
+        )
+        return
+
+    view = BaccaratView(interaction.user.id, bet)
+    baccarat_tables.add(view)
+    try:
+        await interaction.response.send_message(
+            f"🃏 **[바카라]** 배팅 **{bet:,}코인**\n"
+            "어디에 걸까요? 아래 버튼을 눌러 선택하세요. (60초 안에 선택)\n"
+            "• 🔵 플레이어 승 1:1\n• 🔴 뱅커 승 1:1\n• 🟢 타이 8:1 (타이 시 플레이어·뱅커 배팅은 환불)",
+            view=view,
+        )
+        view.message = await interaction.original_response()
+    except Exception:
+        baccarat_tables.discard(view)
+        raise
+
+
 # ==========================================
 # 9. 일반 명령어
 # ==========================================
@@ -1425,12 +1704,93 @@ async def set_slot_rtp(interaction: discord.Interaction, percent: app_commands.R
         await interaction.followup.send(f"❌ 오류: {e}", ephemeral=True)
 
 
+# ---------- 바카라 승률 (완전 숨김 명령어) ----------
+# 슬래시 명령어로 등록하지 않으므로 디스코드 명령어 목록에는 관리자에게도 전혀 보이지 않습니다.
+# 사용법: 서버 채팅 또는 봇 DM 에서  /바카라승률 70  (-1 = 조작 해제)
+#  - 서버 채팅에서 입력하면 메시지를 즉시 삭제하고, 결과는 DM 으로만 알려줍니다.
+#  - 서버 관리자가 아닌 사람이 입력하면 아무 반응도 하지 않습니다.
+#  - 봇 DM 에서 입력하면 본인이 관리자인 모든 서버에 적용됩니다.
+import re
+BACCARAT_RATE_RE = re.compile(r"^/?바카라승률\s+(-?\d{1,3})$")
+
+
+def set_baccarat_rate_db(cur, guild_id, rate):
+    cur.execute(
+        """
+        INSERT INTO guild_settings (guild_id, baccarat_win_rate) VALUES (%s, %s)
+        ON CONFLICT (guild_id) DO UPDATE SET baccarat_win_rate = EXCLUDED.baccarat_win_rate
+        """,
+        (guild_id, rate),
+    )
+
+
+def get_baccarat_rate_db(cur, guild_id):
+    cur.execute("SELECT baccarat_win_rate FROM guild_settings WHERE guild_id=%s", (guild_id,))
+    r = cur.fetchone()
+    return int(r[0]) if r and r[0] is not None else None
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    m = BACCARAT_RATE_RE.match((message.content or "").strip())
+    if m:
+        percent = int(m.group(1))
+        # 대상 서버 결정 + 관리자 확인
+        if message.guild is not None:
+            member = message.author if isinstance(message.author, discord.Member) else message.guild.get_member(message.author.id)
+            guilds = [message.guild] if member and member.guild_permissions.administrator else []
+        else:
+            guilds = []
+            for g in bot.guilds:
+                mem = g.get_member(message.author.id)
+                if mem and mem.guild_permissions.administrator:
+                    guilds.append(g)
+
+        if guilds:
+            if message.guild is not None:
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
+
+            if not (-1 <= percent <= 100):
+                reply = "❌ 승률은 0~100 사이로 입력해 주세요. (-1 = 조작 해제)"
+            else:
+                new = None if percent < 0 else percent
+                fmt = lambda v: "원래 확률" if v is None else f"{v}%"
+                lines = []
+                try:
+                    for g in guilds:
+                        old = await run_db(get_baccarat_rate_db, g.id)
+                        await run_db(set_baccarat_rate_db, g.id, new)
+                        lines.append(f"🃏 [{g.name}] 바카라 승률 **{fmt(old)} → {fmt(new)}**")
+                    reply = "\n".join(lines)
+                except Exception as e:
+                    print(f"[바카라승률 오류] {e}")
+                    reply = f"❌ 오류: {str(e)[:300]}"
+
+            try:
+                await message.author.send(reply)
+            except Exception:
+                if message.guild is not None:
+                    try:
+                        await message.channel.send(f"{message.author.mention} {reply}", delete_after=5)
+                    except Exception:
+                        pass
+            return
+
+    await bot.process_commands(message)
+
+
 @bot.tree.command(name="명령어", description="봇 명령어 목록을 확인합니다.")
 async def show_commands(interaction: discord.Interaction):
     embed = discord.Embed(title="🤖 봇 명령어 안내", color=discord.Color.blue())
     embed.add_field(
         name="👤 일반 명령어",
-        value="• `/정보 [유저]`\n• `/추천인 [유저]`\n• `/슬롯머신 [배팅액]`\n• `/코인순위`\n• `/이용순위`\n• `/명령어`",
+        value="• `/정보 [유저]`\n• `/추천인 [유저]`\n• `/슬롯머신 [배팅액]`\n• `/바카라 [베팅]`\n• `/코인순위`\n• `/이용순위`\n• `/명령어`",
         inline=False,
     )
 

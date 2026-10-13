@@ -437,8 +437,31 @@ intents.message_content = os.getenv("NO_MESSAGE_CONTENT") != "1"
 intents.guild_messages = intents.message_content   # 서버 채팅 이벤트는 숨김 명령어에만 필요
 intents.dm_messages = True
 
+# ---- 디스코드 요청용 고정 프록시 (선택) ----
+# Render 환경변수 DISCORD_PROXY 가 있을 때만 사용, 없으면 지금처럼 직접 연결합니다.
+#   예) http://아이디:비밀번호@프록시주소:포트   또는   http://프록시주소:포트
+# 아이디/비밀번호에 특수문자(@ : / 등)가 있으면 URL 인코딩 해야 합니다.
+# DISCORD_PROXY_USER / DISCORD_PROXY_PASS 를 따로 넣어도 됩니다.
+_proxy_kwargs = {}
+_proxy_url = (os.getenv("DISCORD_PROXY") or "").strip()
+if _proxy_url:
+    from urllib.parse import urlsplit, unquote
+    import aiohttp
+    _p = urlsplit(_proxy_url)
+    if _p.scheme not in ("http", "https"):
+        raise RuntimeError("❌ DISCORD_PROXY 는 http:// 또는 https:// 로 시작하는 HTTP 프록시만 지원합니다.")
+    _user = os.getenv("DISCORD_PROXY_USER") or (unquote(_p.username) if _p.username else None)
+    _pass = os.getenv("DISCORD_PROXY_PASS") or (unquote(_p.password) if _p.password else None)
+    _bare = f"{_p.scheme}://{_p.hostname}" + (f":{_p.port}" if _p.port else "")
+    _proxy_kwargs["proxy"] = _bare
+    if _user:
+        _proxy_kwargs["proxy_auth"] = aiohttp.BasicAuth(_user, _pass or "")
+    print(f"[PROXY] 디스코드 요청에 프록시 사용: {_bare} (인증 {'있음' if _user else '없음'})", flush=True)
+else:
+    print("[PROXY] 프록시 미사용 (직접 연결)", flush=True)
+
 # max_messages=None : 메시지 캐시 불필요 (메모리/CPU 절약)
-bot = commands.Bot(command_prefix="!", intents=intents, max_messages=None)
+bot = commands.Bot(command_prefix="!", intents=intents, max_messages=None, **_proxy_kwargs)
 commands_synced = False
 
 
@@ -1304,6 +1327,50 @@ SLOT_MAX_BET = 300
 active_slot_spins = set()
 slot_semaphore = asyncio.Semaphore(50)
 
+# ---- 게임 과부하 보호 (슬롯/바카라 공용) ----
+# 1) 유저당 쿨다운 : 버튼 연타로 요청이 폭증하는 것을 막음 (환경변수 PLAY_COOLDOWN, 초 단위)
+# 2) 혼잡 시 즉시 거절 : 동시 처리 한도를 넘으면 오래 붙잡고 있다가 3초 제한으로 실패하는 대신 바로 안내
+# 3) 정리(버튼 제거) 수정 제한 : 타임아웃마다 나가던 메시지 수정 요청을 초당 N개로 제한
+PLAY_COOLDOWN = float(os.getenv("PLAY_COOLDOWN", "1.5"))
+CLEANUP_PER_SEC = int(os.getenv("CLEANUP_PER_SEC", "5"))
+_last_play = {}               # (guild_id, user_id) -> 마지막 플레이 시각(monotonic)
+_cleanup_window = [0.0, 0]    # [윈도우 시작, 횟수]
+
+
+def check_cooldown(guild_id, user_id) -> float:
+    """쿨다운이 남아 있으면 남은 초를, 통과하면 0 을 반환하고 시각을 기록한다."""
+    now = time.monotonic()
+    key = (guild_id, user_id)
+    remain = PLAY_COOLDOWN - (now - _last_play.get(key, 0.0))
+    if remain > 0:
+        return remain
+    if len(_last_play) > 5000:  # 메모리 정리
+        for k in [k for k, t in _last_play.items() if now - t > 60]:
+            _last_play.pop(k, None)
+    _last_play[key] = now
+    return 0.0
+
+
+def cleanup_allowed() -> bool:
+    now = time.monotonic()
+    if now - _cleanup_window[0] >= 1.0:
+        _cleanup_window[0] = now
+        _cleanup_window[1] = 0
+    _cleanup_window[1] += 1
+    return _cleanup_window[1] <= CLEANUP_PER_SEC
+
+
+async def reject_if_overloaded(interaction: discord.Interaction, semaphore: asyncio.Semaphore, guild_id, user_id) -> bool:
+    """혼잡하거나 쿨다운 중이면 안내만 하고 True 를 반환 (이 경우 호출한 쪽은 바로 return)."""
+    if semaphore.locked():
+        await interaction.response.send_message("⏳ 지금 이용자가 많아 잠시 처리가 지연되고 있습니다. 잠시 후 다시 시도해 주세요.", ephemeral=True)
+        return True
+    remain = check_cooldown(guild_id, user_id)
+    if remain > 0:
+        await interaction.response.send_message(f"⏱ 너무 빠릅니다. {remain:.1f}초 뒤에 다시 눌러 주세요.", ephemeral=True)
+        return True
+    return False
+
 
 def roll_slot_result(rtp_percent: int):
     rtp = max(0, min(150, int(rtp_percent))) / 100.0
@@ -1372,7 +1439,7 @@ class SlotMachineView(discord.ui.View):
         self.interaction = interaction  # 메시지 수정은 '인터랙션 토큰'으로 (채널 요청 제한/전역 제한에 안 걸림)
 
     async def on_timeout(self):
-        if self.interaction is not None:
+        if self.interaction is not None and cleanup_allowed():
             try:
                 await self.interaction.edit_original_response(view=None)
             except Exception:
@@ -1391,6 +1458,8 @@ class SlotMachineView(discord.ui.View):
         spin_key = (guild_id, user_id)
         if spin_key in active_slot_spins:
             await interaction.response.send_message("⏳ 이미 슬롯머신이 돌아가고 있습니다.", ephemeral=True)
+            return
+        if await reject_if_overloaded(interaction, slot_semaphore, guild_id, user_id):
             return
 
         active_slot_spins.add(spin_key)
@@ -1430,6 +1499,8 @@ async def slot_machine(interaction: discord.Interaction, bet: int):
 
     if spin_key in active_slot_spins:
         await interaction.response.send_message("⏳ 이미 슬롯머신이 돌아가고 있습니다.", ephemeral=True)
+        return
+    if await reject_if_overloaded(interaction, slot_semaphore, guild_id, user_id):
         return
 
     active_slot_spins.add(spin_key)
@@ -1610,7 +1681,7 @@ class BaccaratView(discord.ui.View):
 
     async def on_timeout(self):
         baccarat_tables.discard(self)
-        if self.interaction is not None:
+        if self.interaction is not None and cleanup_allowed():
             try:
                 await self.interaction.edit_original_response(view=None)
             except Exception:
@@ -1628,6 +1699,8 @@ class BaccaratView(discord.ui.View):
         key = (guild_id, user_id)
         if key in active_baccarat:
             await interaction.response.send_message("⏳ 이미 바카라가 진행 중입니다.", ephemeral=True)
+            return
+        if await reject_if_overloaded(interaction, baccarat_semaphore, guild_id, user_id):
             return
 
         active_baccarat.add(key)

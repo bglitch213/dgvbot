@@ -1085,6 +1085,7 @@ async def give_defense_ticket(interaction: discord.Interaction, member: discord.
 # ==========================================
 SLOT_ICONS = ["🍒", "🍋", "🍊", "🔔", "⭐", "💎", "7️⃣"]
 SLOT_OUTCOMES = (("jackpot", 3.0), ("double", 1.5), ("pair", 0.5), ("lose", 0.0))
+SLOT_MAX_BET = 300
 active_slot_spins = set()
 slot_semaphore = asyncio.Semaphore(50)
 
@@ -1213,12 +1214,12 @@ class SlotMachineView(discord.ui.View):
             active_slot_spins.discard(spin_key)
 
 
-@bot.tree.command(name="슬롯머신", description="코인을 걸고 슬롯머신을 돌립니다. (1~500코인)")
+@bot.tree.command(name="슬롯머신", description=f"코인을 걸고 슬롯머신을 돌립니다. (1~{SLOT_MAX_BET}코인)")
 @app_commands.describe(bet="배팅할 코인 수량")
 @app_commands.guild_only()
 async def slot_machine(interaction: discord.Interaction, bet: int):
-    if bet < 1 or bet > 500:
-        await interaction.response.send_message("❌ 배팅 수량은 1 ~ 500코인 사이여야 합니다.", ephemeral=True)
+    if bet < 1 or bet > SLOT_MAX_BET:
+        await interaction.response.send_message(f"❌ 배팅 수량은 1 ~ {SLOT_MAX_BET}코인 사이여야 합니다.", ephemeral=True)
         return
 
     user_id = interaction.user.id

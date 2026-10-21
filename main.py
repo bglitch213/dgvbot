@@ -1433,10 +1433,10 @@ active_slot_spins = set()
 slot_semaphore = asyncio.Semaphore(50)
 
 # ---- 게임 과부하 보호 (슬롯/바카라 공용) ----
-# 1) 유저당 쿨다운 : 버튼 연타로 요청이 폭증하는 것을 막음 (환경변수 PLAY_COOLDOWN, 초 단위)
+# 1) 유저당 쿨다운(기본 2.5초) : 버튼 연타로 요청이 폭증하는 것을 막음 (환경변수 PLAY_COOLDOWN, 초 단위)
 # 2) 혼잡 시 즉시 거절 : 동시 처리 한도를 넘으면 오래 붙잡고 있다가 3초 제한으로 실패하는 대신 바로 안내
 # 3) 정리(버튼 제거) 수정 제한 : 타임아웃마다 나가던 메시지 수정 요청을 초당 N개로 제한
-PLAY_COOLDOWN = float(os.getenv("PLAY_COOLDOWN", "1.5"))
+PLAY_COOLDOWN = float(os.getenv("PLAY_COOLDOWN", "2.5"))
 CLEANUP_PER_SEC = int(os.getenv("CLEANUP_PER_SEC", "5"))
 _last_play = {}               # (guild_id, user_id) -> 마지막 플레이 시각(monotonic)
 _cleanup_window = [0.0, 0]    # [윈도우 시작, 횟수]

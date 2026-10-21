@@ -463,6 +463,107 @@ else:
 
 # max_messages=None : 메시지 캐시 불필요 (메모리/CPU 절약)
 bot = commands.Bot(command_prefix="!", intents=intents, max_messages=None, **_proxy_kwargs)
+
+
+# ==========================================
+# 3-1. Cloudflare 1015 차단 감지 · 로그 간소화 · 차단 중 요청 중단
+# ==========================================
+# 디스코드(Cloudflare)가 이 IP 를 막으면(429 + 에러 1015) 그 사이에 더 요청을 보내도 전부 거절되고,
+# 거절된 요청이 쌓이면 차단이 더 길어집니다. 그래서 차단을 감지하면 일정 시간 요청 자체를 보내지 않습니다.
+#   CF_BLOCK_PAUSE_SEC : 첫 차단 시 쉬는 시간(초, 기본 600). 또 차단되면 2배씩 늘어나며 최대 1시간.
+CF_BLOCK_PAUSE_SEC = int(os.getenv("CF_BLOCK_PAUSE_SEC", "600"))
+_cf_state = {"until": 0.0, "level": 0, "last_log": 0.0}
+
+
+class CloudflareBlocked(Exception):
+    """차단 중이라 디스코드 요청을 보내지 않고 막았을 때 발생."""
+
+
+def is_cf_ban(e) -> bool:
+    if not isinstance(e, discord.HTTPException) or getattr(e, "status", None) != 429:
+        return False
+    text = str(e)
+    return "1015" in text or "cloudflare" in text.lower()
+
+
+def cf_blocked() -> bool:
+    return time.monotonic() < _cf_state["until"]
+
+
+def cf_remaining_min() -> int:
+    return max(1, int((_cf_state["until"] - time.monotonic()) // 60) + 1)
+
+
+def short_err(e) -> str:
+    """예외를 한 줄로 요약 (Cloudflare 에러 페이지 HTML 전체가 로그/유저 메시지에 찍히는 것을 방지)."""
+    if isinstance(e, CloudflareBlocked):
+        return f"Cloudflare 차단 중이라 요청을 보내지 않음 (약 {cf_remaining_min()}분 남음)"
+    if is_cf_ban(e):
+        m = re.search(r"Ray ID:\s*([0-9a-f]{8,})", str(e))
+        return f"Cloudflare 1015 차단 (Ray ID: {m.group(1) if m else '?'})"
+    text = " ".join(str(e).split())
+    return text if len(text) <= 300 else text[:300] + "…"
+
+
+def cf_log(msg: str, every: float = 60.0):
+    """같은 종류의 로그가 도배되지 않도록 every 초에 한 번만 출력."""
+    now = time.monotonic()
+    if now - _cf_state["last_log"] >= every:
+        _cf_state["last_log"] = now
+        print(msg, flush=True)
+
+
+def cf_register_ban(e):
+    now = time.monotonic()
+    if now < _cf_state["until"]:
+        return  # 이미 차단 대기 중 (이미 나간 요청이 뒤늦게 실패한 경우)
+    _cf_state["level"] = min(_cf_state["level"] + 1, 4)
+    pause = min(CF_BLOCK_PAUSE_SEC * (2 ** (_cf_state["level"] - 1)), 3600)
+    _cf_state["until"] = now + pause
+    print(f"[CF 차단 감지] {short_err(e)} → {int(pause // 60)}분간 디스코드 요청을 중단합니다. "
+          f"(연속 {_cf_state['level']}회째)", flush=True)
+
+
+def _install_cf_guard():
+    """discord.py 의 REST/웹훅(인터랙션 응답) 요청 함수를 감싸서, 차단 중에는 요청을 아예 보내지 않는다."""
+    def wrap(owner, name):
+        orig = getattr(owner, name)
+
+        async def guarded(self, *args, **kwargs):
+            if cf_blocked():
+                raise CloudflareBlocked()
+            try:
+                result = await orig(self, *args, **kwargs)
+            except discord.HTTPException as e:
+                if is_cf_ban(e):
+                    cf_register_ban(e)
+                raise
+            _cf_state["level"] = 0  # 정상 응답이 오면 차단 단계 초기화
+            return result
+
+        setattr(owner, name, guarded)
+
+    try:
+        from discord.http import HTTPClient
+        wrap(HTTPClient, "request")
+        from discord.webhook.async_ import AsyncWebhookAdapter
+        wrap(AsyncWebhookAdapter, "request")
+    except Exception as e:  # discord.py 내부 구조가 바뀐 경우에도 봇은 정상 시작
+        print(f"[CF GUARD] 요청 보호 장치 설치 실패(무시하고 계속): {e!r}", flush=True)
+
+
+_install_cf_guard()
+
+
+async def _tree_interaction_check(interaction: discord.Interaction) -> bool:
+    # 차단 중에는 응답 요청조차 보낼 수 없으므로, 명령을 조용히 무시 (로그·요청 모두 발생시키지 않음)
+    if cf_blocked():
+        cf_log(f"[CF 차단 중] 명령 요청을 무시합니다. (약 {cf_remaining_min()}분 남음)")
+        return False
+    return True
+
+
+bot.tree.interaction_check = _tree_interaction_check
 commands_synced = False
 
 
@@ -500,7 +601,7 @@ async def resync_voice_sessions(entries, now):
         try:
             await run_db(_resync_chunk, entries[i:i + 500], now)
         except Exception as e:
-            print(f"[VOICE DEBUG] 세션 복구 오류: {e}")
+            print(f"[VOICE DEBUG] 세션 복구 오류: {short_err(e)}")
 
 
 _last_guild_sync = {}  # guild_id -> 마지막 동기화 시각 (너무 잦은 동기화 방지)
@@ -593,7 +694,7 @@ async def sync_guild_commands(guild: discord.Guild, min_interval: float = 0.0, f
                 _sync_status[guild.id] = f"✅ {guild.name}: 명령어 {n}개 (변경 없음, 등록 생략)"
                 return True
         except Exception as e:
-            print(f"[COMMAND SYNC] 지문 확인 실패(무시하고 등록 진행): {e}", flush=True)
+            print(f"[COMMAND SYNC] 지문 확인 실패(무시하고 등록 진행): {short_err(e)}", flush=True)
 
     try:
         bot.tree.copy_global_to(guild=guild)
@@ -602,7 +703,7 @@ async def sync_guild_commands(guild: discord.Guild, min_interval: float = 0.0, f
             try:
                 await run_db(set_meta_db, meta_key, fp)
             except Exception as e:
-                print(f"[COMMAND SYNC] 지문 저장 실패(무시): {e}", flush=True)
+                print(f"[COMMAND SYNC] 지문 저장 실패(무시): {short_err(e)}", flush=True)
         names = ", ".join(c.name for c in synced)
         print(f"[COMMAND SYNC] {guild.name} ({guild.id}) -> {len(synced)}개: {names}")
         has_rank = any(c.name == "이용순위" for c in synced)
@@ -612,8 +713,8 @@ async def sync_guild_commands(guild: discord.Guild, min_interval: float = 0.0, f
                 print(f"[COMMAND SYNC] 경고지급 입력칸: {[o.name for o in c.options]}")
         return True
     except Exception as e:
-        print(f"[COMMAND SYNC] {guild.name} ({guild.id}) 동기화 오류: {e}")
-        _sync_status[guild.id] = f"❌ {guild.name}: 등록 실패 — {str(e)[:400]}"
+        print(f"[COMMAND SYNC] {guild.name} ({guild.id}) 동기화 오류: {short_err(e)}")
+        _sync_status[guild.id] = f"❌ {guild.name}: 등록 실패 — {short_err(e)}"
         return False
 
 
@@ -635,7 +736,7 @@ async def on_ready():
                 await bot.http.bulk_upsert_global_commands(bot.application_id, [])
                 await run_db(set_meta_db, "global_cleared", "1")
         except Exception as e:
-            print(f"[COMMAND SYNC] 전역 명령어 정리 실패(무시 가능): {e}", flush=True)
+            print(f"[COMMAND SYNC] 전역 명령어 정리 실패(무시 가능): {short_err(e)}", flush=True)
 
         # 서버별로 따로 처리 → 한 서버가 실패해도 계속 진행. 명령어가 안 바뀌었으면 등록을 건너뜀
         results = [await sync_guild_commands(guild) for guild in bot.guilds]
@@ -648,7 +749,7 @@ async def on_ready():
         try:
             version = await run_db(next_version_db)
         except Exception as e:
-            print(f"[버전 증가 실패] {e}", flush=True)
+            print(f"[버전 증가 실패] {short_err(e)}", flush=True)
             version = "확인 실패"
         try:
             info = await bot.application_info()
@@ -656,7 +757,7 @@ async def on_ready():
             report = "\n".join(_sync_status.get(g.id, f"⚠️ {g.name}: 결과 없음") for g in bot.guilds) or "참여한 서버 없음"
             await owner.send(f"🤖 **봇 업데이트 알림**\n🆕 현재 버전: **v{version}**\n{report}")
         except Exception as e:
-            print(f"[시작 보고 DM 실패] {e}")
+            print(f"[시작 보고 DM 실패] {short_err(e)}")
 
     # 멤버 목록 불러오기 (오래 걸리거나 막혀도 위의 명령어 등록에는 영향 없도록 뒤로 이동 + 시간 제한)
     for guild in bot.guilds:
@@ -665,7 +766,7 @@ async def on_ready():
         try:
             await asyncio.wait_for(guild.chunk(cache=True), timeout=60)
         except Exception as e:
-            print(f"[MEMBER CHUNK] {guild.name} 멤버 불러오기 실패/지연: {e}", flush=True)
+            print(f"[MEMBER CHUNK] {guild.name} 멤버 불러오기 실패/지연: {short_err(e)}", flush=True)
 
     # 이미 음성 채널에 들어와 있는 유저 세션 복구
     try:
@@ -678,7 +779,7 @@ async def on_ready():
         if entries:
             await resync_voice_sessions(entries, time.time())
     except Exception as e:
-        print(f"[VOICE DEBUG] 세션 복구 실패: {e}")
+        print(f"[VOICE DEBUG] 세션 복구 실패: {short_err(e)}")
 
     if not check_voice_time.is_running():
         check_voice_time.start()
@@ -713,8 +814,11 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         msg = "❌ 서버 안에서만 사용할 수 있는 명령어입니다."
     else:
         original = getattr(error, "original", error)
-        print(f"[명령어 오류] {original!r}")
-        msg = f"❌ 오류가 발생했습니다: {str(original)[:300]}"
+        if isinstance(original, CloudflareBlocked) or is_cf_ban(original):
+            cf_log(f"[명령어 오류] {short_err(original)}")
+            return  # 차단 중에는 응답도 보낼 수 없으므로 시도하지 않음
+        print(f"[명령어 오류] {short_err(original)}")
+        msg = f"❌ 오류가 발생했습니다: {short_err(original)}"
     try:
         if interaction.response.is_done():
             await interaction.followup.send(msg, ephemeral=True)
@@ -748,9 +852,9 @@ async def check_voice_time():
             try:
                 await run_db(settle_voice_chunk, items[i:i + VOICE_CHUNK], started)
             except Exception as e:
-                print(f"[VOICE DEBUG] 묶음 정산 오류: {e}")
+                print(f"[VOICE DEBUG] 묶음 정산 오류: {short_err(e)}")
     except Exception as e:
-        print(f"[VOICE DEBUG] 전체 음성 체크 오류: {e}")
+        print(f"[VOICE DEBUG] 전체 음성 체크 오류: {short_err(e)}")
 
 
 @check_voice_time.before_loop
@@ -779,7 +883,7 @@ async def on_voice_state_update(member, before, after):
             (is_connected and not was_connected),
         )
     except Exception as e:
-        print(f"[음성 상태 업데이트 오류] {e}")
+        print(f"[음성 상태 업데이트 오류] {short_err(e)}")
 
 
 # ==========================================
@@ -878,7 +982,7 @@ async def clear_user_chat(interaction: discord.Interaction, limit: app_commands.
                 fail_reasons.add(_reason(e))
             except discord.HTTPException as e:
                 # 일괄 삭제 실패 시 한 개씩 다시 시도
-                print(f"[채팅청소 일괄삭제 오류 → 개별 삭제로 재시도] {e}")
+                print(f"[채팅청소 일괄삭제 오류 → 개별 삭제로 재시도] {short_err(e)}")
                 for m in chunk:
                     if await _delete_one(m):
                         deleted_count += 1
@@ -911,7 +1015,7 @@ async def clear_user_chat(interaction: discord.Interaction, limit: app_commands.
 
         await finish_admin_command(interaction, "채팅청소", result, detail)
     except Exception as e:
-        print(f"[채팅청소 오류] {e}")
+        print(f"[채팅청소 오류] {short_err(e)}")
         await interaction.followup.send(f"❌ 메시지 청소 중 오류가 발생했습니다: {e}", ephemeral=True)
 
 
@@ -1001,7 +1105,7 @@ async def send_to_log_channel(guild: discord.Guild, embed: discord.Embed):
     try:
         channel_id = await run_db(get_log_channel_db, guild.id)
     except Exception as e:
-        return False, f"로그 채널 설정 조회 오류: {str(e)[:200]}"
+        return False, f"로그 채널 설정 조회 오류: {short_err(e)}"
     if not channel_id:
         return None, "로그 채널이 설정되지 않았습니다."
 
@@ -1046,7 +1150,7 @@ async def finish_admin_command(interaction: discord.Interaction, command_name: s
         try:
             await interaction.followup.send(embed=embed, ephemeral=False, allowed_mentions=NO_MENTIONS)
         except Exception as e:
-            print(f"[공개 기록 대체 전송 오류] /{command_name}: {e}")
+            print(f"[공개 기록 대체 전송 오류] /{command_name}: {short_err(e)}")
 
     await interaction.followup.send(result_text + status, ephemeral=True, allowed_mentions=NO_MENTIONS)
 
@@ -1083,7 +1187,7 @@ async def set_log_channel(interaction: discord.Interaction):
             f"로그 채널 지정: {channel.mention}",
         )
     except Exception as e:
-        print(f"[로그 설정 오류] {e}")
+        print(f"[로그 설정 오류] {short_err(e)}")
         await interaction.followup.send(f"❌ 오류: {e}", ephemeral=True)
 
 
@@ -1152,8 +1256,8 @@ async def handle_add_warning(interaction: discord.Interaction, member: discord.M
     try:
         r = await run_db(adjust_warning_db, interaction.guild_id, member.id, member.name, amount)
     except Exception as e:
-        print(f"[경고 DB 오류] {e}")
-        await interaction.followup.send(f"❌ 경고 처리 중 오류가 발생했습니다.\n```{str(e)[:1500]}```", ephemeral=True)
+        print(f"[경고 DB 오류] {short_err(e)}")
+        await interaction.followup.send(f"❌ 경고 처리 중 오류가 발생했습니다.\n```{short_err(e)}```", ephemeral=True)
         return
 
     name = member.display_name
@@ -1439,8 +1543,11 @@ class SlotMachineView(discord.ui.View):
         self.bet_amount = bet_amount
         self.interaction = interaction  # 메시지 수정은 '인터랙션 토큰'으로 (채널 요청 제한/전역 제한에 안 걸림)
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return not cf_blocked()
+
     async def on_timeout(self):
-        if self.interaction is not None and cleanup_allowed():
+        if self.interaction is not None and cleanup_allowed() and not cf_blocked():
             try:
                 await self.interaction.edit_original_response(view=None)
             except Exception:
@@ -1477,9 +1584,9 @@ class SlotMachineView(discord.ui.View):
             new_view = SlotMachineView(self.author_id, self.bet_amount, interaction)
             await interaction.edit_original_response(content=build_slot_text(res, self.bet_amount), view=new_view)
         except Exception as e:
-            print(f"[슬롯 오류] {e}")
+            print(f"[슬롯 오류] {short_err(e)}")
             try:
-                await interaction.edit_original_response(content=f"❌ 슬롯머신 처리 중 오류가 발생했습니다: {str(e)[:200]}", view=None)
+                await interaction.edit_original_response(content=f"❌ 슬롯머신 처리 중 오류가 발생했습니다: {short_err(e)}", view=None)
             except Exception:
                 pass
         finally:
@@ -1517,9 +1624,9 @@ async def slot_machine(interaction: discord.Interaction, bet: int):
         view = SlotMachineView(user_id, bet, interaction)
         await interaction.edit_original_response(content=build_slot_text(res, bet), view=view)
     except Exception as e:
-        print(f"[슬롯 오류] {e}")
+        print(f"[슬롯 오류] {short_err(e)}")
         try:
-            await interaction.edit_original_response(content=f"❌ 슬롯머신 처리 중 오류가 발생했습니다: {str(e)[:200]}", view=None)
+            await interaction.edit_original_response(content=f"❌ 슬롯머신 처리 중 오류가 발생했습니다: {short_err(e)}", view=None)
         except Exception:
             pass
     finally:
@@ -1694,9 +1801,12 @@ class BaccaratView(discord.ui.View):
         self.bet_amount = bet_amount
         self.interaction = interaction  # 메시지 수정은 '인터랙션 토큰'으로 (채널 요청 제한/전역 제한에 안 걸림)
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return not cf_blocked()
+
     async def on_timeout(self):
         baccarat_tables.discard(self)
-        if self.interaction is not None and cleanup_allowed():
+        if self.interaction is not None and cleanup_allowed() and not cf_blocked():
             try:
                 await self.interaction.edit_original_response(view=None)
             except Exception:
@@ -1737,9 +1847,9 @@ class BaccaratView(discord.ui.View):
                 baccarat_tables.discard(new_view)
                 raise
         except Exception as e:
-            print(f"[바카라 오류] {e}")
+            print(f"[바카라 오류] {short_err(e)}")
             try:
-                await interaction.edit_original_response(content=f"❌ 바카라 처리 중 오류가 발생했습니다: {str(e)[:200]}", view=None)
+                await interaction.edit_original_response(content=f"❌ 바카라 처리 중 오류가 발생했습니다: {short_err(e)}", view=None)
             except Exception:
                 pass
         finally:
@@ -2037,7 +2147,7 @@ async def set_slot_rtp(interaction: discord.Interaction, percent: app_commands.R
         # 비공개 명령어이므로 로그 채널/채팅창에 공개 기록을 남기지 않고 본인에게만 응답합니다.
         await interaction.followup.send(f"🎰 슬롯머신 환수율을 **{old}% → {percent}%** 로 변경했습니다.", ephemeral=True)
     except Exception as e:
-        print(f"[슬롯머신설정 오류] {e}")
+        print(f"[슬롯머신설정 오류] {short_err(e)}")
         await interaction.followup.send(f"❌ 오류: {e}", ephemeral=True)
 
 
@@ -2104,7 +2214,7 @@ async def on_message(message: discord.Message):
                         lines.append(f"🃏 [{g.name}] 현재 바카라 승률: **{'원래 확률(조작 없음)' if cur_rate is None else f'{cur_rate}%'}**")
                     reply = "\n".join(lines)
                 except Exception as e:
-                    reply = f"❌ 오류: {str(e)[:300]}"
+                    reply = f"❌ 오류: {short_err(e)}"
             elif not (-1 <= percent <= 100):
                 reply = "❌ 승률은 0~100 사이로 입력해 주세요. (-1 = 조작 해제)"
             else:
@@ -2118,8 +2228,8 @@ async def on_message(message: discord.Message):
                         lines.append(f"🃏 [{g.name}] 바카라 승률 **{fmt(old)} → {fmt(new)}**")
                     reply = "\n".join(lines)
                 except Exception as e:
-                    print(f"[바카라승률 오류] {e}")
-                    reply = f"❌ 오류: {str(e)[:300]}"
+                    print(f"[바카라승률 오류] {short_err(e)}")
+                    reply = f"❌ 오류: {short_err(e)}"
 
             try:
                 await message.author.send(reply)
@@ -2169,13 +2279,13 @@ if __name__ == "__main__":
         # 프로세스는 살려 둔 채(웹서버는 계속 응답) 오래 기다렸다가 스스로 다시 시작한다.
         tries = int(os.getenv("DISCORD_429_TRIES", "0")) + 1
         wait_min = min(15 * tries, 60)          # 15분 → 30분 → 45분 → 60분(최대)
-        print(f"[로그인 차단 429] 디스코드가 요청을 일시 차단했습니다. {wait_min}분 뒤 다시 시도합니다. (시도 {tries}회째)", flush=True)
+        print(f"[로그인 차단 429] {short_err(e)} · {wait_min}분 뒤 다시 시도합니다. (시도 {tries}회째)", flush=True)
         time.sleep(wait_min * 60)
         os.environ["DISCORD_429_TRIES"] = str(tries)
         import sys
         os.execv(sys.executable, [sys.executable] + sys.argv)
     except discord.errors.PrivilegedIntentsRequired as e:
-        print(f"[시작 오류] 개발자 포털에서 특권 인텐트가 꺼져 있습니다: {e}")
+        print(f"[시작 오류] 개발자 포털에서 특권 인텐트가 꺼져 있습니다: {short_err(e)}")
         if os.getenv("NO_MESSAGE_CONTENT") != "1":
             # MESSAGE CONTENT 만 끄고 다시 시작 (슬래시 명령어는 정상 동작, /바카라승률 숨김 명령만 비활성)
             print("[시작 오류] MESSAGE CONTENT INTENT 없이 다시 시작합니다. (/바카라승률 비활성) "

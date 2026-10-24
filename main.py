@@ -1255,7 +1255,7 @@ async def clear_user_chat(interaction: discord.Interaction, limit: app_commands.
         )
         return
 
-    await interaction.response.defer(thinking=True, ephemeral=True)
+    await interaction.response.defer(thinking=True)
 
     try:
         messages_to_delete = []
@@ -1379,7 +1379,7 @@ def sync_usernames_db(cur, guild_id, rows):
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def force_sync_usernames(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True, ephemeral=True)
+    await interaction.response.defer(thinking=True)
     guild = interaction.guild
     rows = [(m.id, m.name) for m in guild.members if not m.bot]
     if not rows:
@@ -1494,27 +1494,23 @@ async def send_to_log_channel(guild: discord.Guild, embed: discord.Embed):
 async def finish_admin_command(interaction: discord.Interaction, command_name: str, result_text: str, detail: str):
     """
     관리자 명령어가 성공했을 때 마지막에 호출 (반드시 interaction.response.defer() 이후):
-      1) /로그 로 설정한 채널에 '누가 어떤 명령어를 썼는지' 공개 기록 (모두에게 보이는 일반 메시지)
-      2) 실행자에게만 결과 + 기록 성공/실패 안내
-      3) 로그 채널이 미설정/오류일 때만, 기록이 사라지지 않도록 현재 채팅창에 대신 공개
+      1) /로그 로 설정한 채널에 '누가 어떤 명령어를 썼는지' 기록
+      2) 명령어를 입력한 채팅창에 결과를 모두에게 공개로 표시 (ephemeral=False)
     """
     embed = build_admin_embed(interaction, command_name, detail)
     ok, info = await send_to_log_channel(interaction.guild, embed)
 
     if ok is True:
-        status = f"\n\n📝 사용 기록을 {info} 에 공개로 남겼습니다."
+        status = f"\n\n📝 사용 기록을 {info} 에도 남겼습니다."
+    elif ok is None:
+        status = "\n\n⚠️ 로그 채널이 설정되지 않았습니다. `/로그` 로 채널을 설정해 주세요."
     else:
-        if ok is None:
-            status = "\n\n⚠️ 로그 채널이 설정되지 않았습니다. `/로그` 로 채널을 설정해 주세요. (이번 기록은 이 채팅창에 대신 공개했습니다)"
-        else:
-            status = f"\n\n⚠️ 사용 기록 저장 실패: {info}\n(이번 기록은 이 채팅창에 대신 공개했습니다)"
-            print(f"[로그 오류] {interaction.guild_id} /{command_name}: {info}")
-        try:
-            await interaction.followup.send(embed=embed, ephemeral=False, allowed_mentions=NO_MENTIONS)
-        except Exception as e:
-            print(f"[공개 기록 대체 전송 오류] /{command_name}: {short_err(e)}")
+        status = f"\n\n⚠️ 사용 기록 저장 실패: {info}"
+        print(f"[로그 오류] {interaction.guild_id} /{command_name}: {info}")
 
-    await interaction.followup.send(result_text + status, ephemeral=True, allowed_mentions=NO_MENTIONS)
+    await interaction.followup.send(
+        result_text + status, embed=embed, ephemeral=False, allowed_mentions=NO_MENTIONS
+    )
 
 
 @bot.tree.command(name="로그", description="이 채널을 관리자 명령어 사용 기록 채널로 지정합니다. (관리자 전용)")
@@ -1542,7 +1538,7 @@ async def set_log_channel(interaction: discord.Interaction):
         )
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
     try:
         await run_db(set_log_channel_db, guild.id, channel.id)
         await finish_admin_command(
@@ -1575,7 +1571,7 @@ async def set_voicelog_channel(interaction: discord.Interaction):
         )
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
     try:
         await run_db(set_voicelog_channel_db, guild.id, channel.id)
         await finish_admin_command(
@@ -1608,7 +1604,7 @@ async def set_chatlog_channel(interaction: discord.Interaction):
         )
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
     try:
         await run_db(set_chatlog_channel_db, guild.id, channel.id)
         await finish_admin_command(
@@ -1682,7 +1678,7 @@ async def handle_add_warning(interaction: discord.Interaction, member: discord.M
         await interaction.response.send_message("❌ 수량은 -100 ~ 100 사이로 입력해 주세요.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
     try:
         r = await run_db(adjust_warning_db, interaction.guild_id, member.id, member.name, amount)
     except Exception as e:
@@ -1766,7 +1762,7 @@ async def give_coins(interaction: discord.Interaction, member: discord.Member, a
     if amount <= 0:
         await interaction.response.send_message("❌ 1 이상을 입력해 주세요.", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
     try:
         balance = await run_db(give_coins_db, interaction.guild_id, member.id, member.name, amount)
         await finish_admin_command(
@@ -1803,7 +1799,7 @@ async def take_coins(interaction: discord.Interaction, member: discord.Member, a
     if amount <= 0:
         await interaction.response.send_message("❌ 1 이상을 입력해 주세요.", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
     try:
         result = await run_db(take_coins_db, interaction.guild_id, member.id, amount)
     except Exception as e:
@@ -1844,7 +1840,7 @@ async def give_defense_ticket(interaction: discord.Interaction, member: discord.
     if amount <= 0:
         await interaction.response.send_message("❌ 1 이상을 입력해 주세요.", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
     try:
         total = await run_db(give_defense_db, interaction.guild_id, member.id, member.name, amount)
         await finish_admin_command(

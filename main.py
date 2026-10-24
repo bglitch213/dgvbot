@@ -4,6 +4,7 @@ import time
 import asyncio
 import random
 import threading
+from collections import OrderedDict
 from threading import Thread
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -183,6 +184,8 @@ def init_db():
         cur.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS slot_rtp INTEGER DEFAULT 85")
         cur.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS baccarat_win_rate INTEGER DEFAULT NULL")
         cur.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS log_channel_id BIGINT DEFAULT NULL")
+        cur.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS chatlog_channel_id BIGINT DEFAULT NULL")
+        cur.execute("ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS voicelog_channel_id BIGINT DEFAULT NULL")
 
     _run(_init)
 
@@ -209,10 +212,10 @@ def ensure_user(cur, guild_id, user_id, username=None):
 # 1-2. 서버 설정 캐시 (슬롯/바카라/음성 보상률을 매번 DB 에서 읽지 않도록)
 # ==========================================
 _SETTINGS_TTL = 15.0
-_SETTING_KEYS = ("voice_reward_rate", "referral_reward", "log_channel_id", "slot_rtp", "baccarat_win_rate")
+_SETTING_KEYS = ("voice_reward_rate", "referral_reward", "log_channel_id", "slot_rtp", "baccarat_win_rate", "chatlog_channel_id", "voicelog_channel_id")
 _SETTING_DEFAULTS = {
     "voice_reward_rate": 1, "referral_reward": 30, "log_channel_id": None,
-    "slot_rtp": 85, "baccarat_win_rate": None,
+    "slot_rtp": 85, "baccarat_win_rate": None, "chatlog_channel_id": None, "voicelog_channel_id": None,
 }
 _settings_cache = {}  # guild_id -> (만료 시각, {설정})
 
@@ -222,7 +225,7 @@ def get_cached_setting(cur, guild_id, key):
     hit = _settings_cache.get(guild_id)
     if hit is None or hit[0] < now:
         cur.execute(
-            "SELECT voice_reward_rate, referral_reward, log_channel_id, slot_rtp, baccarat_win_rate "
+            "SELECT voice_reward_rate, referral_reward, log_channel_id, slot_rtp, baccarat_win_rate, chatlog_channel_id, voicelog_channel_id "
             "FROM guild_settings WHERE guild_id=%s",
             (guild_id,),
         )
@@ -435,7 +438,7 @@ intents.members = True  # 개발자 포털에서 SERVER MEMBERS INTENT 를 반�
 # 숨김 명령어(/바카라승률) 용. 개발자 포털에서 MESSAGE CONTENT INTENT 를 켜야 합니다.
 # (꺼져 있으면 아래 시작부에서 자동으로 이 기능만 끄고 봇은 정상 시작합니다.)
 intents.message_content = os.getenv("NO_MESSAGE_CONTENT") != "1"
-intents.guild_messages = intents.message_content   # 서버 채팅 이벤트는 숨김 명령어에만 필요
+intents.guild_messages = True   # 숨김 명령어 + 채팅 삭제/수정 로그에 필요
 intents.dm_messages = True
 
 # ---- 디스코드 요청용 고정 프록시 (선택) ----
@@ -783,6 +786,8 @@ async def on_ready():
 
     if not check_voice_time.is_running():
         check_voice_time.start()
+    if (VOICE_LOG_ENABLED or CHAT_LOG_ENABLED) and not voice_log_flush.is_running():
+        voice_log_flush.start()
 
 
 @bot.event
@@ -867,6 +872,21 @@ async def on_voice_state_update(member, before, after):
     if member.bot:
         return
 
+    # 입장/퇴장/이동 기록 (/로그 채널로 묶어서 전송)
+    try:
+        b_id = before.channel.id if before.channel else None
+        a_id = after.channel.id if after.channel else None
+        if b_id != a_id:
+            who = f"{member.mention} `{member.name}`"
+            if b_id is None:
+                vlog_add(member.guild.id, f"🟢 {who} 입장 → {after.channel.mention}")
+            elif a_id is None:
+                vlog_add(member.guild.id, f"🔴 {who} 퇴장 ← {before.channel.mention}")
+            else:
+                vlog_add(member.guild.id, f"🔁 {who} 이동 {before.channel.mention} → {after.channel.mention}")
+    except Exception as e:
+        print(f"[음성 로그 오류] {short_err(e)}")
+
     was_connected = before.channel is not None
     is_connected = after.channel is not None
     muted_after = voice_is_muted(after)
@@ -887,12 +907,329 @@ async def on_voice_state_update(member, before, after):
 
 
 # ==========================================
+# 4-1. 🔊 음성 채널 입장/퇴장/이동/생성 로그  (/음챗로그 로 지정한 채널로 전송)
+#   · 이벤트마다 메시지를 보내면 디스코드 요청이 폭증하므로, 5초마다 모아서 한 메시지로 묶어 보냅니다.
+#   · 차단(CF) 중에는 보내지 않고 쌓아 두며, 권한 오류가 나면 잠시 중지합니다. (불필요한 403 요청 방지)
+#   · 끄려면 Render 환경변수 VOICE_LOG=0
+# ==========================================
+VOICE_LOG_ENABLED = os.getenv("VOICE_LOG", "1") != "0"
+CHAT_LOG_ENABLED = os.getenv("CHAT_LOG", "1") != "0"
+VOICE_LOG_FLUSH_SEC = 5
+VOICE_LOG_MAX_BUFFER = 300   # 서버·종류별 전송 대기 줄 수 상한 (넘으면 생략 건수만 기록)
+VOICE_LOG_MAX_MSGS = 3       # 한 번 전송할 때 서버·종류별 최대 메시지 수
+# 기록 종류 → 어떤 설정(채널)으로 보낼지.   voice: /음챗로그 채널,  chat: /채팅로그 채널
+_LOG_KINDS = {"voice": "voicelog_channel_id", "chat": "chatlog_channel_id"}
+_vlog_buffer = {}            # (guild_id, 종류) -> [줄, ...]
+_vlog_dropped = {}           # (guild_id, 종류) -> 생략된 줄 수
+_vlog_disabled_until = {}    # (guild_id, 종류) -> 이 시각(monotonic)까지 전송 중지 (권한 오류 시)
+_audit_window = [0.0, 0]     # 감사 로그 조회 횟수 제한용 [윈도우 시작, 횟수]
+_audit_disabled_until = {}   # guild_id -> 감사 로그 권한 없을 때 조회 중지
+_audit_seen = {}             # guild_id -> {감사로그 항목 id: 삭제 횟수}  (어떤 삭제가 새로 생긴 것인지 구분용)
+_audit_baseline = set()      # 감사 로그를 한 번이라도 조회한 서버
+
+
+def vlog_add(guild_id: int, text: str, kind: str = "voice"):
+    enabled = VOICE_LOG_ENABLED if kind == "voice" else CHAT_LOG_ENABLED
+    key = (guild_id, kind)
+    if not enabled or time.monotonic() < _vlog_disabled_until.get(key, 0.0):
+        return
+    buf = _vlog_buffer.setdefault(key, [])
+    if len(buf) >= VOICE_LOG_MAX_BUFFER:
+        _vlog_dropped[key] = _vlog_dropped.get(key, 0) + 1
+        return
+    buf.append(f"<t:{int(time.time())}:T> {text}")
+
+
+def get_log_channel_cached(cur, guild_id, setting_key="log_channel_id"):
+    return get_cached_setting(cur, guild_id, setting_key)
+
+
+def build_log_chunks(lines, dropped=0, max_len=1900, max_msgs=VOICE_LOG_MAX_MSGS):
+    """항목들을 디스코드 글자 수 제한에 맞게 최대 max_msgs 개 메시지로 묶고, 넘치는 건 '외 N건 생략'으로 표시."""
+    chunks, cur_text, used = [], "", 0
+    for ln in lines:
+        ln = ln[:max_len - 2]
+        if cur_text and len(cur_text) + len(ln) + 1 > max_len:
+            chunks.append(cur_text)
+            cur_text = ""
+            if len(chunks) >= max_msgs:
+                break
+        cur_text += ln + "\n"
+        used += 1
+    if cur_text:
+        chunks.append(cur_text)
+    omitted = (len(lines) - used) + dropped
+    if omitted > 0 and chunks:
+        chunks[-1] += f"… 외 {omitted}건 생략\n"
+    return chunks
+
+
+@tasks.loop(seconds=VOICE_LOG_FLUSH_SEC)
+async def voice_log_flush():
+    if not _vlog_buffer or cf_blocked():
+        return  # 차단 중에는 보내지 않고 쌓아 둠 (상한까지)
+    for key in list(_vlog_buffer.keys()):
+        guild_id, kind = key
+        lines = _vlog_buffer.pop(key, [])
+        dropped = _vlog_dropped.pop(key, 0)
+        if not lines:
+            continue
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            continue
+        try:
+            channel_id = await run_db(get_log_channel_cached, guild_id, _LOG_KINDS[kind])
+        except Exception as e:
+            print(f"[기록 전송] 채널 설정 조회 오류: {short_err(e)}")
+            continue
+        if not channel_id:
+            continue  # 채널 미설정 → 기록하지 않음
+        channel = guild.get_channel(int(channel_id))
+        if channel is None:
+            continue  # 삭제/비공개 채널 → 조용히 건너뜀 (추가 요청 없음)
+
+        for text in build_log_chunks(lines, dropped):
+            try:
+                await channel.send(text, allowed_mentions=NO_MENTIONS, suppress_embeds=True)
+            except discord.Forbidden:
+                _vlog_disabled_until[key] = time.monotonic() + 1800
+                print(f"[기록 전송] {guild.name}: 기록 채널에 메시지 보낼 권한이 없어 30분간 중지합니다. ({kind})", flush=True)
+                break
+            except Exception as e:
+                cf_log(f"[기록 전송] 전송 실패: {short_err(e)}")
+                break
+
+
+@voice_log_flush.before_loop
+async def _before_voice_log_flush():
+    await bot.wait_until_ready()
+
+
+def audit_rate_ok(limit: int = 12) -> bool:
+    """감사 로그 조회는 봇 전체에서 분당 limit 회까지만 (디스코드 요청 폭증 방지)."""
+    now = time.monotonic()
+    if now - _audit_window[0] >= 60:
+        _audit_window[0], _audit_window[1] = now, 0
+    _audit_window[1] += 1
+    return _audit_window[1] <= limit
+
+
+async def find_channel_creator(channel):
+    """감사 로그에서 채널 생성자를 찾는다 (권한 없거나 요청이 많으면 None)."""
+    guild = channel.guild
+    if cf_blocked() or time.monotonic() < _audit_disabled_until.get(guild.id, 0.0) or not audit_rate_ok():
+        return None
+    try:
+        await asyncio.sleep(1.5)  # 감사 로그에 반영될 때까지 잠깐 대기
+        async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.channel_create):
+            if entry.target is not None and entry.target.id == channel.id:
+                return entry.user
+    except discord.Forbidden:
+        _audit_disabled_until[guild.id] = time.monotonic() + 3600  # '감사 로그 보기' 권한 없음 → 1시간 동안 조회 안 함
+    except Exception:
+        pass
+    return None
+
+
+async def find_message_deleter(guild, author_id: int, channel_id: int):
+    """
+    감사 로그로 '누가 메시지를 지웠는지' 추정한다. 반환: (상태, 유저)
+      'found' 다른 사람이 삭제한 기록을 찾음 / 'none' 해당 기록 없음(본인 삭제 등) / 'skip' 조회하지 못함
+    본인이 지운 메시지는 감사 로그에 남지 않으므로 'none' 이 됩니다.
+    """
+    if cf_blocked() or time.monotonic() < _audit_disabled_until.get(guild.id, 0.0) or not audit_rate_ok():
+        return "skip", None
+    try:
+        await asyncio.sleep(1.5)
+        seen = _audit_seen.setdefault(guild.id, {})
+        baseline = guild.id in _audit_baseline
+        found = None
+        async for entry in guild.audit_logs(limit=6, action=discord.AuditLogAction.message_delete):
+            count = int(getattr(entry.extra, "count", 1) or 1)
+            prev = seen.get(entry.id)
+            if prev is None:
+                # 처음 보는 항목: 이미 조회한 적 있으면 새로 생긴 것, 처음 조회라면 최근 20초 안의 것만 인정
+                is_new = baseline or (discord.utils.utcnow() - entry.created_at).total_seconds() < 20
+            else:
+                is_new = count > prev  # 같은 사람이 같은 채널에서 또 지우면 횟수만 늘어남
+            seen[entry.id] = count
+            if (found is None and is_new and entry.target is not None
+                    and getattr(entry.target, "id", None) == author_id
+                    and getattr(getattr(entry.extra, "channel", None), "id", None) == channel_id):
+                found = entry.user
+        _audit_baseline.add(guild.id)
+        if len(seen) > 100:
+            for k in sorted(seen)[:-60]:
+                seen.pop(k, None)
+        return ("found", found) if found is not None else ("none", None)
+    except discord.Forbidden:
+        _audit_disabled_until[guild.id] = time.monotonic() + 3600
+        return "skip", None
+    except Exception:
+        return "skip", None
+
+
+@bot.event
+async def on_guild_channel_create(channel):
+    if not VOICE_LOG_ENABLED or not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+        return
+    try:
+        creator = await find_channel_creator(channel)
+        by = f" · 생성: {creator.mention}" if creator else ""
+        vlog_add(channel.guild.id, f"🆕 음성 채널 생성 {channel.mention} `{channel.name}`{by}")
+    except Exception as e:
+        print(f"[음성 로그 오류] {short_err(e)}")
+
+
+# ==========================================
+# 4-2. 💬 채팅 삭제/수정 로그  (/채팅로그 로 지정한 채널로 전송)
+#   · 디스코드는 '누가 지웠는지'를 이벤트로 알려주지 않아서, 감사 로그로 추정합니다.
+#     (작성자 본인이 지운 메시지는 감사 로그에 남지 않아 '작성자 본인 또는 확인 불가' 로 표시)
+#   · 내용은 봇이 켜진 뒤에 올라온 사용자 메시지만 메모리에 잠깐(최근 CHAT_CACHE_MAX 개) 보관합니다.
+#   · 끄려면 Render 환경변수 CHAT_LOG=0
+# ==========================================
+CHAT_CACHE_MAX = 10000
+CHAT_TEXT_MAX = 1500           # 보관하는 메시지 글자 수 상한
+CHAT_QUOTE_MAX = 500           # 기록에 보여주는 글자 수 상한
+_HIDDEN_PREFIXES = ("/바카라승률", "바카라승률")   # 숨김 명령어 메시지는 기록하지 않음
+_chat_cache = OrderedDict()    # message_id -> {"a": 작성자id, "n": 이름, "c": 채널id, "t": 내용, "f": 첨부파일명}
+_chatlog_skip_ids = OrderedDict()  # 봇이 직접 지우는 메시지 id (/채팅청소 등) → 기록 제외
+
+
+def chatlog_skip(ids):
+    for i in ids:
+        _chatlog_skip_ids[int(i)] = True
+    while len(_chatlog_skip_ids) > 3000:
+        _chatlog_skip_ids.popitem(last=False)
+
+
+def chatlog_cache_message(message: discord.Message):
+    if not CHAT_LOG_ENABLED or message.guild is None:
+        return
+    files = ", ".join(a.filename for a in message.attachments)[:200] if message.attachments else ""
+    _chat_cache[message.id] = {
+        "a": message.author.id, "n": message.author.name, "c": message.channel.id,
+        "t": (message.content or "")[:CHAT_TEXT_MAX], "f": files,
+    }
+    while len(_chat_cache) > CHAT_CACHE_MAX:
+        _chat_cache.popitem(last=False)
+
+
+def _quote(text: str, files: str = "") -> str:
+    text = (text or "").replace("```", "'''")
+    if len(text) > CHAT_QUOTE_MAX:
+        text = text[:CHAT_QUOTE_MAX] + "…"
+    parts = text.split("\n")
+    lines = [("> " + ln) if ln else ">" for ln in parts[:8]]
+    if len(parts) > 8:
+        lines.append("> …")
+    if not text.strip():
+        lines = ["> (내용 없음)"]
+    if files:
+        lines.append(f"> 📎 {files}")
+    return "\n".join(lines)
+
+
+async def chatlog_channel_set(guild_id: int) -> bool:
+    try:
+        return bool(await run_db(get_log_channel_cached, guild_id, "chatlog_channel_id"))
+    except Exception:
+        return False
+
+
+@bot.event
+async def on_raw_message_delete(payload):
+    if not CHAT_LOG_ENABLED or payload.guild_id is None:
+        return
+    try:
+        if _chatlog_skip_ids.pop(payload.message_id, None) is not None:
+            _chat_cache.pop(payload.message_id, None)
+            return  # 봇이 직접 지운 메시지(/채팅청소 등)는 기록하지 않음
+        info = _chat_cache.pop(payload.message_id, None)
+        if info is None:
+            return  # 봇이 켜지기 전 메시지 / 봇 메시지 → 내용을 알 수 없어 기록하지 않음
+        guild = bot.get_guild(payload.guild_id)
+        if guild is None or not await chatlog_channel_set(guild.id):
+            return  # /채팅로그 미설정 서버는 감사 로그 조회 등 추가 요청도 하지 않음
+
+        status, deleter = await find_message_deleter(guild, info["a"], info["c"])
+        if status == "found" and deleter is not None:
+            by = "삭제자: 작성자 본인" if deleter.id == info["a"] else f"삭제자: {deleter.mention} (감사 로그 기준)"
+        elif status == "none":
+            by = "삭제자: 작성자 본인 또는 확인 불가"
+        else:
+            by = "삭제자: 확인 불가 (감사 로그 조회 생략)"
+        who = f"<@{info['a']}> `{info['n']}`"
+        vlog_add(guild.id, f"🗑️ **메시지 삭제** · {who} · <#{info['c']}> · {by}\n{_quote(info['t'], info['f'])}", kind="chat")
+    except Exception as e:
+        print(f"[채팅 로그 오류] {short_err(e)}")
+
+
+@bot.event
+async def on_raw_bulk_message_delete(payload):
+    if not CHAT_LOG_ENABLED or payload.guild_id is None:
+        return
+    try:
+        remaining = 0
+        for mid in payload.message_ids:
+            _chat_cache.pop(mid, None)
+            if _chatlog_skip_ids.pop(mid, None) is None:
+                remaining += 1
+        if remaining <= 0 or not await chatlog_channel_set(payload.guild_id):
+            return
+        vlog_add(payload.guild_id, f"🧹 **메시지 일괄 삭제** · <#{payload.channel_id}> · {remaining}개", kind="chat")
+    except Exception as e:
+        print(f"[채팅 로그 오류] {short_err(e)}")
+
+
+@bot.event
+async def on_raw_message_edit(payload):
+    if not CHAT_LOG_ENABLED or payload.guild_id is None:
+        return
+    try:
+        data = payload.data or {}
+        new = data.get("content")
+        if new is None or not data.get("edited_timestamp"):
+            return  # 링크 미리보기 갱신 등 '내용 수정'이 아닌 업데이트
+        author = data.get("author") or {}
+        if author.get("bot") or data.get("webhook_id") or new.startswith(_HIDDEN_PREFIXES):
+            return
+        new = new[:CHAT_TEXT_MAX]
+        info = _chat_cache.get(payload.message_id)
+        if info is None:
+            if not author.get("id"):
+                return
+            old = None
+            aid, name, cid, files = int(author["id"]), author.get("username", "?"), payload.channel_id, ""
+        else:
+            old, aid, name, cid, files = info["t"], info["a"], info["n"], info["c"], info["f"]
+            if old == new:
+                return
+            info["t"] = new
+        if info is None:
+            _chat_cache[payload.message_id] = {"a": aid, "n": name, "c": cid, "t": new, "f": ""}
+        if not await chatlog_channel_set(payload.guild_id):
+            return
+        url = f"https://discord.com/channels/{payload.guild_id}/{cid}/{payload.message_id}"
+        before = _quote(old, files) if old is not None else "> (기록 없음 · 봇이 켜지기 전에 올라온 메시지)"
+        vlog_add(
+            payload.guild_id,
+            f"✏️ **메시지 수정** · <@{aid}> `{name}` · <#{cid}> · [메시지로 이동](<{url}>)\n"
+            f"**이전**\n{before}\n**이후**\n{_quote(new)}",
+            kind="chat",
+        )
+    except Exception as e:
+        print(f"[채팅 로그 오류] {short_err(e)}")
+
+
+# ==========================================
 # 5. 🧹 채팅 청소 명령어
 # ==========================================
 @bot.tree.command(name="채팅청소", description="지정한 수량만큼 채팅을 삭제합니다. (선택적으로 특정 유저만 삭제 가능)")
 @app_commands.describe(limit="삭제할 메시지 수 (1~100, 필수)", member="청소할 대상 유저 (선택, 비우면 전체 최근 메시지)")
 @app_commands.rename(limit="수량", member="유저")
 @app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def clear_user_chat(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 100], member: discord.Member = None):
     if limit < 1 or limit > 100:
@@ -947,6 +1284,8 @@ async def clear_user_chat(interaction: discord.Interaction, limit: app_commands.
                 recent_messages.append(m)
             else:
                 old_messages.append(m)
+
+        chatlog_skip(m.id for m in recent_messages + old_messages)  # 관리자가 /채팅청소 로 지우는 메시지는 채팅 로그에서 제외
 
         deleted_count = 0
         failed_count = 0
@@ -1037,6 +1376,7 @@ def sync_usernames_db(cur, guild_id, rows):
 
 @bot.tree.command(name="닉네임동기화", description="서버 내 모든 멤버의 닉네임을 DB에 강제로 일괄 동기화합니다.")
 @app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def force_sync_usernames(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True, ephemeral=True)
@@ -1068,6 +1408,28 @@ def set_log_channel_db(cur, guild_id, channel_id):
         """
         INSERT INTO guild_settings (guild_id, log_channel_id) VALUES (%s, %s)
         ON CONFLICT (guild_id) DO UPDATE SET log_channel_id = EXCLUDED.log_channel_id
+        """,
+        (guild_id, channel_id),
+    )
+    invalidate_settings(guild_id)
+
+
+def set_chatlog_channel_db(cur, guild_id, channel_id):
+    cur.execute(
+        """
+        INSERT INTO guild_settings (guild_id, chatlog_channel_id) VALUES (%s, %s)
+        ON CONFLICT (guild_id) DO UPDATE SET chatlog_channel_id = EXCLUDED.chatlog_channel_id
+        """,
+        (guild_id, channel_id),
+    )
+    invalidate_settings(guild_id)
+
+
+def set_voicelog_channel_db(cur, guild_id, channel_id):
+    cur.execute(
+        """
+        INSERT INTO guild_settings (guild_id, voicelog_channel_id) VALUES (%s, %s)
+        ON CONFLICT (guild_id) DO UPDATE SET voicelog_channel_id = EXCLUDED.voicelog_channel_id
         """,
         (guild_id, channel_id),
     )
@@ -1157,6 +1519,7 @@ async def finish_admin_command(interaction: discord.Interaction, command_name: s
 
 @bot.tree.command(name="로그", description="이 채널을 관리자 명령어 사용 기록 채널로 지정합니다. (관리자 전용)")
 @app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def set_log_channel(interaction: discord.Interaction):
     channel = interaction.channel
@@ -1189,6 +1552,72 @@ async def set_log_channel(interaction: discord.Interaction):
     except Exception as e:
         print(f"[로그 설정 오류] {short_err(e)}")
         await interaction.followup.send(f"❌ 오류: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="음챗로그", description="이 채널을 음성 채널 입장/퇴장 기록 채널로 지정합니다. (관리자 전용)")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def set_voicelog_channel(interaction: discord.Interaction):
+    channel = interaction.channel
+    guild = interaction.guild
+    if channel is None or not hasattr(channel, "send"):
+        await interaction.response.send_message("⚠️ 이 채널은 음챗 로그 채널로 지정할 수 없습니다.", ephemeral=True)
+        return
+
+    perms = channel.permissions_for(guild.me)
+    missing = [
+        label for label, ok in (("채널 보기", perms.view_channel), ("메시지 보내기", perms.send_messages)) if not ok
+    ]
+    if missing:
+        await interaction.response.send_message(
+            f"❌ 봇에게 이 채널의 **{', '.join(missing)}** 권한이 없어 지정하지 못했습니다.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await run_db(set_voicelog_channel_db, guild.id, channel.id)
+        await finish_admin_command(
+            interaction, "음챗로그", f"✅ 이 채널({channel.mention})을 음성 채널 입장/퇴장 기록 채널로 지정했습니다.",
+            f"음챗 로그 채널 지정: {channel.mention}",
+        )
+    except Exception as e:
+        print(f"[음챗로그 설정 오류] {short_err(e)}")
+        await interaction.followup.send(f"❌ 오류: {short_err(e)}", ephemeral=True)
+
+
+@bot.tree.command(name="채팅로그", description="이 채널을 채팅 삭제/수정 기록 채널로 지정합니다. (관리자 전용)")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def set_chatlog_channel(interaction: discord.Interaction):
+    channel = interaction.channel
+    guild = interaction.guild
+    if channel is None or not hasattr(channel, "send"):
+        await interaction.response.send_message("⚠️ 이 채널은 채팅 로그 채널로 지정할 수 없습니다.", ephemeral=True)
+        return
+
+    perms = channel.permissions_for(guild.me)
+    missing = [
+        label for label, ok in (("채널 보기", perms.view_channel), ("메시지 보내기", perms.send_messages)) if not ok
+    ]
+    if missing:
+        await interaction.response.send_message(
+            f"❌ 봇에게 이 채널의 **{', '.join(missing)}** 권한이 없어 지정하지 못했습니다.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await run_db(set_chatlog_channel_db, guild.id, channel.id)
+        await finish_admin_command(
+            interaction, "채팅로그", f"✅ 이 채널({channel.mention})을 채팅 삭제/수정 기록 채널로 지정했습니다.",
+            f"채팅 로그 채널 지정: {channel.mention}",
+        )
+    except Exception as e:
+        print(f"[채팅로그 설정 오류] {short_err(e)}")
+        await interaction.followup.send(f"❌ 오류: {short_err(e)}", ephemeral=True)
 
 
 def compute_warning_change(warnings, tickets, amount):
@@ -1236,6 +1665,7 @@ def adjust_warning_db(cur, guild_id, user_id, username, amount):
 @app_commands.describe(member="대상 유저", amount="경고 수량 (양수 = 지급, 음수 = 차감)")
 @app_commands.rename(member="닉네임", amount="수량")
 @app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def add_warning(interaction: discord.Interaction, member: discord.Member, amount: int):
     await handle_add_warning(interaction, member, amount)
@@ -1330,6 +1760,7 @@ def give_coins_db(cur, guild_id, user_id, username, amount):
 @bot.tree.command(name="코인지급", description="특정 유저에게 코인을 지급합니다. (관리자 전용)")
 @app_commands.describe(member="코인을 받을 유저", amount="지급할 코인 수량")
 @app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def give_coins(interaction: discord.Interaction, member: discord.Member, amount: int):
     if amount <= 0:
@@ -1366,6 +1797,7 @@ def take_coins_db(cur, guild_id, user_id, amount):
 @bot.tree.command(name="코인회수", description="특정 유저의 코인을 회수합니다. (관리자 전용)")
 @app_commands.describe(member="코인을 회수할 유저", amount="회수할 코인 수량")
 @app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def take_coins(interaction: discord.Interaction, member: discord.Member, amount: int):
     if amount <= 0:
@@ -1406,6 +1838,7 @@ def give_defense_db(cur, guild_id, user_id, username, amount):
 @bot.tree.command(name="방어권지급", description="특정 유저에게 방어권을 지급합니다. (관리자 전용)")
 @app_commands.describe(member="방어권을 받을 유저", amount="지급할 수량")
 @app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def give_defense_ticket(interaction: discord.Interaction, member: discord.Member, amount: int = 1):
     if amount <= 0:
@@ -1433,10 +1866,10 @@ active_slot_spins = set()
 slot_semaphore = asyncio.Semaphore(50)
 
 # ---- 게임 과부하 보호 (슬롯/바카라 공용) ----
-# 1) 유저당 쿨다운(기본 2.5초) : 버튼 연타로 요청이 폭증하는 것을 막음 (환경변수 PLAY_COOLDOWN, 초 단위)
+# 1) 유저당 쿨다운(기본 3.5초) : 버튼 연타로 요청이 폭증하는 것을 막음 (환경변수 PLAY_COOLDOWN, 초 단위)
 # 2) 혼잡 시 즉시 거절 : 동시 처리 한도를 넘으면 오래 붙잡고 있다가 3초 제한으로 실패하는 대신 바로 안내
 # 3) 정리(버튼 제거) 수정 제한 : 타임아웃마다 나가던 메시지 수정 요청을 초당 N개로 제한
-PLAY_COOLDOWN = float(os.getenv("PLAY_COOLDOWN", "2.5"))
+PLAY_COOLDOWN = float(os.getenv("PLAY_COOLDOWN", "3.5"))
 CLEANUP_PER_SEC = int(os.getenv("CLEANUP_PER_SEC", "5"))
 _last_play = {}               # (guild_id, user_id) -> 마지막 플레이 시각(monotonic)
 _cleanup_window = [0.0, 0]    # [윈도우 시작, 횟수]
@@ -2184,6 +2617,8 @@ async def on_message(message: discord.Message):
         return
 
     content = (message.content or "").strip()
+    if message.guild is not None and not content.startswith(_HIDDEN_PREFIXES):
+        chatlog_cache_message(message)  # 채팅 삭제/수정 로그용 (숨김 명령어는 보관하지 않음)
     m = BACCARAT_RATE_RE.match(content) if content.startswith(("/바카라승률", "바카라승률")) else None
     if m:
         percent = int(m.group(1)) if m.group(1) is not None else None  # None = 현재 값만 조회
@@ -2258,7 +2693,7 @@ async def show_commands(interaction: discord.Interaction):
     if perms is not None and perms.administrator:
         embed.add_field(
             name="🛡 관리자 전용",
-            value="• `/채팅청소 [수량] [유저]` (수량 입력 후 유저는 선택사항)\n• `/경고지급 [유저] [횟수] [사유]` (횟수에 음수 입력 시 경고 차감)\n• `/코인지급`\n• `/코인회수`\n• `/방어권지급`\n• `/닉네임동기화`\n• `/로그` (명령어를 입력한 채널을 사용 기록 채널로 지정)",
+            value="• `/채팅청소 [수량] [유저]` (수량 입력 후 유저는 선택사항)\n• `/경고지급 [유저] [횟수] [사유]` (횟수에 음수 입력 시 경고 차감)\n• `/코인지급`\n• `/코인회수`\n• `/방어권지급`\n• `/닉네임동기화`\n• `/로그` (명령어를 입력한 채널을 관리자 명령어 사용 기록 채널로 지정)\n• `/음챗로그` (명령어를 입력한 채널을 음성 채널 입장/퇴장 기록 채널로 지정)\n• `/채팅로그` (명령어를 입력한 채널을 채팅 삭제/수정 기록 채널로 지정)",
             inline=False,
         )
     await interaction.response.send_message(embed=embed, ephemeral=True)

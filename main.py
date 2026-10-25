@@ -1094,6 +1094,7 @@ CHAT_QUOTE_MAX = 500           # 기록에 보여주는 글자 수 상한
 _HIDDEN_PREFIXES = ("/바카라승률", "바카라승률")   # 숨김 명령어 메시지는 기록하지 않음
 _chat_cache = OrderedDict()    # message_id -> {"a": 작성자id, "n": 이름, "c": 채널id, "t": 내용, "f": 첨부파일명}
 _chatlog_skip_ids = OrderedDict()  # 봇이 직접 지우는 메시지 id (/채팅청소 등) → 기록 제외
+LOGMSG_LABEL = "🛡️ 관리자 명령어 기록"  # /로그 채널에 봇이 쓴 메시지 표시용
 
 
 def chatlog_skip(ids):
@@ -1101,6 +1102,27 @@ def chatlog_skip(ids):
         _chatlog_skip_ids[int(i)] = True
     while len(_chatlog_skip_ids) > 3000:
         _chatlog_skip_ids.popitem(last=False)
+
+
+def chatlog_cache_bot_logmsg(message: discord.Message, text: str):
+    """/로그 채널에 봇이 쓴 관리자 명령어 기록을 보관해 두었다가, 관리자가 지우면 /채팅로그 에 남기기 위함."""
+    if not CHAT_LOG_ENABLED or message.guild is None:
+        return
+    _chat_cache[message.id] = {
+        "a": message.author.id, "n": message.author.name, "c": message.channel.id,
+        "t": text[:CHAT_TEXT_MAX], "f": "", "k": "logmsg",
+    }
+    while len(_chat_cache) > CHAT_CACHE_MAX:
+        _chat_cache.popitem(last=False)
+
+
+def _one_line(text: str, files: str = "", limit: int = 80) -> str:
+    t = (text or "").replace("```", "'''").replace("\n", " ").strip()
+    if len(t) > limit:
+        t = t[:limit] + "…"
+    if not t:
+        t = "(내용 없음)"
+    return t + (f" 📎 {files}" if files else "")
 
 
 def chatlog_cache_message(message: discord.Message):
@@ -1159,8 +1181,13 @@ async def on_raw_message_delete(payload):
             by = "삭제자: 작성자 본인 또는 확인 불가"
         else:
             by = "삭제자: 확인 불가 (감사 로그 조회 생략)"
-        who = f"<@{info['a']}> `{info['n']}`"
-        vlog_add(guild.id, f"🗑️ **메시지 삭제** · {who} · <#{info['c']}> · {by}\n{_quote(info['t'], info['f'])}", kind="chat")
+        if info.get("k") == "logmsg":
+            if status == "none":
+                by = "삭제자: 확인 불가 (감사 로그 기록 없음)"
+            vlog_add(guild.id, f"🗑️ **{LOGMSG_LABEL} 삭제** · <#{info['c']}> · {by}\n{_quote(info['t'])}", kind="chat")
+        else:
+            who = f"<@{info['a']}> `{info['n']}`"
+            vlog_add(guild.id, f"🗑️ **메시지 삭제** · {who} · <#{info['c']}> · {by}\n{_quote(info['t'], info['f'])}", kind="chat")
     except Exception as e:
         print(f"[채팅 로그 오류] {short_err(e)}")
 
@@ -1170,14 +1197,18 @@ async def on_raw_bulk_message_delete(payload):
     if not CHAT_LOG_ENABLED or payload.guild_id is None:
         return
     try:
-        remaining = 0
-        for mid in payload.message_ids:
-            _chat_cache.pop(mid, None)
+        remaining, logmsgs = 0, []
+        for mid in sorted(payload.message_ids):
+            info = _chat_cache.pop(mid, None)
             if _chatlog_skip_ids.pop(mid, None) is None:
                 remaining += 1
+                if info is not None and info.get("k") == "logmsg":
+                    logmsgs.append(info)
         if remaining <= 0 or not await chatlog_channel_set(payload.guild_id):
             return
         vlog_add(payload.guild_id, f"🧹 **메시지 일괄 삭제** · <#{payload.channel_id}> · {remaining}개", kind="chat")
+        for info in logmsgs:  # 관리자 명령어 기록(봇 메시지)은 내용까지 남김
+            vlog_add(payload.guild_id, f"　🗑️ **{LOGMSG_LABEL}** · {_one_line(info['t'], limit=120)}", kind="chat")
     except Exception as e:
         print(f"[채팅 로그 오류] {short_err(e)}")
 
@@ -1483,7 +1514,14 @@ async def send_to_log_channel(guild: discord.Guild, embed: discord.Embed):
             return False, f"로그 채널 조회 오류: {e}"
 
     try:
-        await channel.send(embed=embed, allowed_mentions=NO_MENTIONS)
+        sent = await channel.send(embed=embed, allowed_mentions=NO_MENTIONS)
+        try:
+            cmd = next((f.value for f in embed.fields if "명령어" in f.name), "")
+            who = next((f.value for f in embed.fields if "사용자" in f.name), "").split("\n")[0]
+            body = next((f.value for f in embed.fields if "내용" in f.name), "")
+            chatlog_cache_bot_logmsg(sent, f"{cmd} · {who}\n{body}".strip())
+        except Exception:
+            pass
     except discord.Forbidden:
         return False, f"봇에게 {channel.mention} 의 **메시지 보내기 / 링크 첨부** 권한이 없습니다."
     except discord.HTTPException as e:

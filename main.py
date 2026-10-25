@@ -1513,6 +1513,49 @@ async def finish_admin_command(interaction: discord.Interaction, command_name: s
     )
 
 
+@bot.tree.command(name="공지", description="입력한 내용을 봇이 이 채팅방에 대신 작성합니다. (관리자 전용)")
+@app_commands.describe(message="채팅방에 올릴 내용 (줄바꿈은 \\n 으로 입력)")
+@app_commands.rename(message="할말")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def announce(interaction: discord.Interaction, message: app_commands.Range[str, 1, 2000]):
+    text = message.replace("\\n", "\n").strip()
+    if not text:
+        await interaction.response.send_message("⚠️ 공지할 내용을 입력해 주세요.", ephemeral=True)
+        return
+
+    channel = interaction.channel
+    if channel is None or not hasattr(channel, "send"):
+        await interaction.response.send_message("⚠️ 이 채널에는 공지를 올릴 수 없습니다.", ephemeral=True)
+        return
+
+    perms = channel.permissions_for(interaction.guild.me)
+    if not (perms.view_channel and perms.send_messages):
+        await interaction.response.send_message(
+            "❌ 봇에게 이 채널의 **채널 보기 / 메시지 보내기** 권한이 필요합니다.", ephemeral=True
+        )
+        return
+
+    # 명령어 사용 표시가 채팅방에 남지 않도록 비공개로 응답하고, 실제 공지는 봇이 직접 작성
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await channel.send(text, allowed_mentions=discord.AllowedMentions(everyone=True, roles=True, users=True))
+    except Exception as e:
+        print(f"[공지 오류] {short_err(e)}")
+        await interaction.followup.send(f"❌ 공지 전송 실패: {e}", ephemeral=True)
+        return
+
+    # 관리자 사용 기록은 로그 채널에 남김 (채팅방에는 공지 본문만 보이게)
+    try:
+        embed = build_admin_embed(interaction, "공지", f"공지 내용: {text[:900]}")
+        await send_to_log_channel(interaction.guild, embed)
+    except Exception as e:
+        print(f"[공지 로그 오류] {short_err(e)}")
+
+    await interaction.followup.send("✅ 공지를 올렸습니다.", ephemeral=True)
+
+
 @bot.tree.command(name="로그", description="이 채널을 관리자 명령어 사용 기록 채널로 지정합니다. (관리자 전용)")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)

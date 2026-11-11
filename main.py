@@ -1611,7 +1611,7 @@ async def send_to_log_channel(guild: discord.Guild, embed: discord.Embed):
     return True, channel.mention
 
 
-async def finish_admin_command(interaction: discord.Interaction, command_name: str, result_text: str, detail: str):
+async def finish_admin_command(interaction: discord.Interaction, command_name: str, result_text: str, detail: str, show_log_status: bool = True):
     """
     관리자 명령어가 성공했을 때 마지막에 호출 (반드시 interaction.response.defer() 이후):
       1) /로그 로 설정한 채널에 '누가 어떤 명령어를 썼는지' 기록
@@ -1627,6 +1627,8 @@ async def finish_admin_command(interaction: discord.Interaction, command_name: s
     else:
         status = f"\n\n⚠️ 사용 기록 저장 실패: {info}"
         print(f"[로그 오류] {interaction.guild_id} /{command_name}: {info}")
+    if not show_log_status:  # 로그 채널 기록은 그대로 하되 "기록했습니다" 안내 문구만 채팅에서 뺌
+        status = ""
 
     await interaction.followup.send(
         result_text + status, embed=embed, ephemeral=False, allowed_mentions=NO_MENTIONS
@@ -1771,7 +1773,7 @@ async def scrim_open(interaction: discord.Interaction, capacity: app_commands.Ra
             interaction, "내전열기",
             f"🎮 **발로란트 내전 신청을 시작합니다!** (선착순 **{capacity}명**, 이후는 대기)\n`/내전신청 닉네임 현재티어 현재rr 최고티어 최고rr` 로 신청해 주세요.\n"
             "예) `/내전신청 홍길동#KR1 다이아몬드 2 45 불멸 1 20`",
-            f"내전 신청 열기 (정원 {capacity}명, 이전 명단 삭제)",
+            f"내전 신청 열기 (정원 {capacity}명, 이전 명단 삭제)", show_log_status=False,
         )
     except Exception as e:
         print(f"[내전열기 오류] {short_err(e)}")
@@ -1857,7 +1859,7 @@ async def scrim_remove(interaction: discord.Interaction, user: discord.User):
         if res is None:
             await interaction.followup.send(f"⚠️ {user.mention} 님은 내전 신청 명단에 없습니다.", allowed_mentions=NO_MENTIONS)
             return
-        await finish_admin_command(interaction, "내전제거", f"🗑️ {user.mention} 님을 내전 명단에서 제거했습니다.", f"내전 신청 제거: {user} ({user.id})")
+        await finish_admin_command(interaction, "내전제거", f"🗑️ {user.mention} 님을 내전 명단에서 제거했습니다.", f"내전 신청 제거: {user} ({user.id})", show_log_status=False)
         if res[1]:
             await interaction.followup.send(_promo_text(res[1]).strip(), allowed_mentions=_PROMO_MENTION(res[1]))
     except Exception as e:
@@ -1915,7 +1917,7 @@ async def scrim_close(interaction: discord.Interaction):
         await finish_admin_command(
             interaction, "내전종료",
             f"🏁 **내전 신청이 마감되었습니다!** 참가 **{min(total, cap)}명**" + (f" · 대기 **{total - cap}명**" if total > cap else "") + f"\n⚖️ 팀 밸런스 맞추기: {SCRIM_SITE_URL}",
-            f"내전 신청 종료 (신청 {total}명, 정원 {cap}명)",
+            f"내전 신청 종료 (신청 {total}명, 정원 {cap}명)", show_log_status=False,
         )
     except Exception as e:
         print(f"[내전종료 오류] {short_err(e)}")
@@ -2016,7 +2018,7 @@ async def scrim_teams(
         embed.set_footer(text=f"참가 {len(players)}명 · 현재 티어 {cur_weight}% / 최고 티어 {100 - cur_weight}% 반영")
         await interaction.followup.send(embed=embed, allowed_mentions=NO_MENTIONS)
         await finish_admin_command(interaction, "내전팀뽑기", "⚔️ 내전 팀을 짰습니다. 다시 뽑으려면 `/내전팀뽑기` 를 다시 사용하세요.",
-                                   f"내전 팀 뽑기 ({num}팀 × {team_size}명, 신청 {len(players)}명)")
+                                   f"내전 팀 뽑기 ({num}팀 × {team_size}명, 신청 {len(players)}명)", show_log_status=False)
     except Exception as e:
         print(f"[내전팀뽑기 오류] {short_err(e)}")
         await interaction.followup.send(f"❌ 오류: {e}", ephemeral=True)

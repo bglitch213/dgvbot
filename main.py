@@ -1611,7 +1611,7 @@ async def send_to_log_channel(guild: discord.Guild, embed: discord.Embed):
     return True, channel.mention
 
 
-async def finish_admin_command(interaction: discord.Interaction, command_name: str, result_text: str, detail: str, show_log_status: bool = True):
+async def finish_admin_command(interaction: discord.Interaction, command_name: str, result_text: str, detail: str, show_log_status: bool = True, show_embed: bool = True):
     """
     관리자 명령어가 성공했을 때 마지막에 호출 (반드시 interaction.response.defer() 이후):
       1) /로그 로 설정한 채널에 '누가 어떤 명령어를 썼는지' 기록
@@ -1631,7 +1631,8 @@ async def finish_admin_command(interaction: discord.Interaction, command_name: s
         status = ""
 
     await interaction.followup.send(
-        result_text + status, embed=embed, ephemeral=False, allowed_mentions=NO_MENTIONS
+        result_text + status, ephemeral=False, allowed_mentions=NO_MENTIONS,
+        **({"embed": embed} if show_embed else {}),  # 로그 채널 기록은 그대로, 채팅에는 임베드 생략 가능
     )
 
 
@@ -1726,7 +1727,7 @@ async def scrim_apply(
     interaction: discord.Interaction,
     nickname: app_commands.Range[str, 1, 40],
     cur_tier: str, cur_rr: app_commands.Range[int, 0, 999],
-    peak_tier: str, peak_rr: app_commands.Range[int, 0, 999],
+    peak_tier: str, peak_rr: app_commands.Range[int, 0, 10000],
 ):
     ct, pt = SCRIM_TIERS.get(cur_tier.replace(" ", "")), SCRIM_TIERS.get(peak_tier.replace(" ", ""))
     if not ct or not pt:
@@ -1773,7 +1774,7 @@ async def scrim_open(interaction: discord.Interaction, capacity: app_commands.Ra
             interaction, "내전열기",
             f"🎮 **발로란트 내전 신청을 시작합니다!** (선착순 **{capacity}명**, 이후는 대기)\n`/내전신청 닉네임 현재티어 현재rr 최고티어 최고rr` 로 신청해 주세요.\n"
             "예) `/내전신청 홍길동#KR1 다이아몬드 2 45 불멸 1 20`",
-            f"내전 신청 열기 (정원 {capacity}명, 이전 명단 삭제)", show_log_status=False,
+            f"내전 신청 열기 (정원 {capacity}명, 이전 명단 삭제)", show_log_status=False, show_embed=False,
         )
     except Exception as e:
         print(f"[내전열기 오류] {short_err(e)}")

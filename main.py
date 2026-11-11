@@ -1917,7 +1917,7 @@ async def scrim_close(interaction: discord.Interaction):
         cap, total = closed
         await finish_admin_command(
             interaction, "내전종료",
-            f"🏁 **내전 신청이 마감되었습니다!** 참가 **{min(total, cap)}명**" + (f" · 대기 **{total - cap}명**" if total > cap else "") + f"\n⚖️ 팀 밸런스 맞추기: {SCRIM_SITE_URL}",
+            f"🏁 **내전 신청이 마감되었습니다!** 참가 **{min(total, cap)}명**" + (f" · 대기 **{total - cap}명**" if total > cap else ""),
             f"내전 신청 종료 (신청 {total}명, 정원 {cap}명)", show_log_status=False,
         )
     except Exception as e:

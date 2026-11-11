@@ -13,7 +13,10 @@ from datetime import datetime, timezone, timedelta
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-from flask import Flask
+from flask import Flask, Response, request
+import csv
+import io
+import secrets
 import psycopg2
 from psycopg2 import pool as pg_pool
 from psycopg2.extras import execute_values
@@ -33,6 +36,23 @@ app = Flask(__name__)
 @app.route('/')
 def home():
     return "Bot is running!"
+
+
+@app.route('/api/scrim.csv')
+def scrim_csv():
+    """웹사이트(밸런서)가 불러가는 내전 신청 명단. 주소: /api/scrim.csv?guild=서버ID&key=SCRIM_KEY"""
+    key = os.getenv("SCRIM_KEY", "")
+    if key and not secrets.compare_digest(request.args.get("key", ""), key):
+        return "forbidden", 403
+    try:
+        gid = int(request.args.get("guild", ""))
+    except ValueError:
+        return "guild 값(서버 ID)이 필요합니다.", 400
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["닉네임", "현재티어", "현재RR", "최고티어", "최고RR"])   # 웹사이트가 요구하는 헤더 그대로
+    w.writerows(_run(scrim_entries_db, gid))
+    return Response(out.getvalue(), mimetype="text/csv")
 
 
 def run():
@@ -171,6 +191,27 @@ def init_db():
             CREATE TABLE IF NOT EXISTS bot_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT
+            )
+        """)
+        # 내전: 서버별 신청 열림 여부 + 신청자 명단 (열기 때 이전 명단은 지워지고, 종료 후에도 다음 열기 전까지 남음)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS scrim_state (
+                guild_id BIGINT PRIMARY KEY,
+                is_open BOOLEAN NOT NULL DEFAULT FALSE
+            )
+        """)
+        cur.execute("ALTER TABLE scrim_state ADD COLUMN IF NOT EXISTS capacity INTEGER NOT NULL DEFAULT 10")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS scrim_entries (
+                guild_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                nickname TEXT NOT NULL,
+                cur_tier TEXT NOT NULL,
+                cur_rr INTEGER NOT NULL,
+                peak_tier TEXT NOT NULL,
+                peak_rr INTEGER NOT NULL,
+                applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (guild_id, user_id)
             )
         """)
         # 기존 테이블을 쓰는 경우에도 필요한 컬럼을 자동 보완
@@ -475,7 +516,13 @@ bot = commands.Bot(command_prefix="!", intents=intents, max_messages=None, **_pr
 # 거절된 요청이 쌓이면 차단이 더 길어집니다. 그래서 차단을 감지하면 일정 시간 요청 자체를 보내지 않습니다.
 #   CF_BLOCK_PAUSE_SEC : 첫 차단 시 쉬는 시간(초, 기본 600). 또 차단되면 2배씩 늘어나며 최대 1시간.
 CF_BLOCK_PAUSE_SEC = int(os.getenv("CF_BLOCK_PAUSE_SEC", "600"))
-_cf_state = {"until": 0.0, "level": 0, "last_log": 0.0}
+#   차단이 풀린 직후에는 쌓여 있던 요청(로그 전송 등)이 한꺼번에 나가 다시 차단되기 쉬워서, 천천히 재개합니다.
+#   CF_RAMP_SEC            : 재개 후 속도를 서서히 올리는 시간(초, 기본 300)
+#   CF_RAMP_START_INTERVAL : 재개 직후 봇 요청 사이의 간격(초, 기본 2.5) → 위 시간에 걸쳐 0 으로 줄어듦
+CF_RAMP_SEC = int(os.getenv("CF_RAMP_SEC", "300"))
+CF_RAMP_START_INTERVAL = float(os.getenv("CF_RAMP_START_INTERVAL", "2.5"))
+_cf_state = {"until": 0.0, "level": 0, "last_log": 0.0, "ramping": False, "ramp_start": 0.0, "ramp_last": 0.0}
+_cf_pace_lock = None
 
 
 class CloudflareBlocked(Exception):
@@ -523,32 +570,66 @@ def cf_register_ban(e):
     _cf_state["level"] = min(_cf_state["level"] + 1, 4)
     pause = min(CF_BLOCK_PAUSE_SEC * (2 ** (_cf_state["level"] - 1)), 3600)
     _cf_state["until"] = now + pause
+    _cf_state["ramping"] = True      # 차단이 풀리면 천천히 재개
+    _cf_state["ramp_start"] = 0.0
     print(f"[CF 차단 감지] {short_err(e)} → {int(pause // 60)}분간 디스코드 요청을 중단합니다. "
           f"(연속 {_cf_state['level']}회째)", flush=True)
 
 
+async def cf_ramp_wait():
+    """차단이 풀린 직후 일정 시간 동안, 봇이 보내는 일반 요청(로그 전송·메시지 수정 등)을 한 번에 하나씩 간격을 두고 보낸다.
+    간격은 CF_RAMP_START_INTERVAL 에서 시작해 CF_RAMP_SEC 동안 0 으로 줄어든다. (명령어 응답(인터랙션)은 3초 제한이 있어 늦추지 않음)"""
+    global _cf_pace_lock
+    st = _cf_state
+    if not st["ramping"]:
+        return
+    now = time.monotonic()
+    if st["ramp_start"] == 0.0:
+        st["ramp_start"] = now          # 차단이 끝난 뒤 첫 요청 시각
+        print(f"[CF 재개] 차단이 풀려 {CF_RAMP_SEC}초 동안 요청 속도를 천천히 올립니다.", flush=True)
+    elapsed = now - st["ramp_start"]
+    if elapsed >= CF_RAMP_SEC:
+        st["ramping"] = False
+        st["ramp_start"] = 0.0
+        print("[CF 재개] 속도를 정상으로 되돌렸습니다.", flush=True)
+        return
+    interval = CF_RAMP_START_INTERVAL * (1.0 - elapsed / CF_RAMP_SEC)
+    if _cf_pace_lock is None:
+        _cf_pace_lock = asyncio.Lock()
+    async with _cf_pace_lock:
+        wait = st["ramp_last"] + interval - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        st["ramp_last"] = time.monotonic()
+
+
 def _install_cf_guard():
     """discord.py 의 REST/웹훅(인터랙션 응답) 요청 함수를 감싸서, 차단 중에는 요청을 아예 보내지 않는다."""
-    def wrap(owner, name):
+    def wrap(owner, name, pace=False):
         orig = getattr(owner, name)
 
         async def guarded(self, *args, **kwargs):
             if cf_blocked():
                 raise CloudflareBlocked()
+            if pace:
+                await cf_ramp_wait()
+                if cf_blocked():          # 기다리는 사이에 다시 차단된 경우
+                    raise CloudflareBlocked()
             try:
                 result = await orig(self, *args, **kwargs)
             except discord.HTTPException as e:
                 if is_cf_ban(e):
                     cf_register_ban(e)
                 raise
-            _cf_state["level"] = 0  # 정상 응답이 오면 차단 단계 초기화
+            if not _cf_state["ramping"]:
+                _cf_state["level"] = 0  # 천천히 재개하는 동안에는 단계를 유지 (그 사이 또 차단되면 더 길게 쉼)
             return result
 
         setattr(owner, name, guarded)
 
     try:
         from discord.http import HTTPClient
-        wrap(HTTPClient, "request")
+        wrap(HTTPClient, "request", pace=True)
         from discord.webhook.async_ import AsyncWebhookAdapter
         wrap(AsyncWebhookAdapter, "request")
     except Exception as e:  # discord.py 내부 구조가 바뀐 경우에도 봇은 정상 시작
@@ -908,13 +989,14 @@ async def on_voice_state_update(member, before, after):
 
 # ==========================================
 # 4-1. 🔊 음성 채널 입장/퇴장/이동/생성 로그  (/음챗로그 로 지정한 채널로 전송)
-#   · 이벤트마다 메시지를 보내면 디스코드 요청이 폭증하므로, 5초마다 모아서 한 메시지로 묶어 보냅니다.
+#   · 이벤트마다 메시지를 보내면 디스코드 요청이 폭증하므로, 30초마다 모아서 한 메시지로 묶어 보냅니다.
+#     (간격은 Render 환경변수 LOG_FLUSH_SEC 로 조절, 최소 5초 · 기본 30초)
 #   · 차단(CF) 중에는 보내지 않고 쌓아 두며, 권한 오류가 나면 잠시 중지합니다. (불필요한 403 요청 방지)
 #   · 끄려면 Render 환경변수 VOICE_LOG=0
 # ==========================================
 VOICE_LOG_ENABLED = os.getenv("VOICE_LOG", "1") != "0"
 CHAT_LOG_ENABLED = os.getenv("CHAT_LOG", "1") != "0"
-VOICE_LOG_FLUSH_SEC = 5
+VOICE_LOG_FLUSH_SEC = max(5, int(os.getenv("LOG_FLUSH_SEC", "30")))   # 기록 묶음 전송 간격(초)
 VOICE_LOG_MAX_BUFFER = 300   # 서버·종류별 전송 대기 줄 수 상한 (넘으면 생략 건수만 기록)
 VOICE_LOG_MAX_MSGS = 3       # 한 번 전송할 때 서버·종류별 최대 메시지 수
 # 기록 종류 → 어떤 설정(채널)으로 보낼지.   voice: /음챗로그 채널,  chat: /채팅로그 채널
@@ -1549,6 +1631,268 @@ async def finish_admin_command(interaction: discord.Interaction, command_name: s
     await interaction.followup.send(
         result_text + status, embed=embed, ephemeral=False, allowed_mentions=NO_MENTIONS
     )
+
+
+# ==========================================
+# 🎮 발로란트 내전 (신청 → 웹사이트에서 팀 밸런스)
+#   /내전열기 (관리자) → 이전 명단 삭제 + 신청 시작
+#   /내전신청 닉네임 현재티어 현재rr 최고티어 최고rr → 신청(다시 입력하면 수정)
+#   /내전종료 (관리자) → 신청 마감.  명단은 /api/scrim.csv 로 웹사이트가 가져감
+#   결과는 모두 채팅창에 공개로 표시
+# ==========================================
+SCRIM_SITE_URL = "https://dgv-balancer-jspmebzvfw6gx6wfpyxxxw.streamlit.app/"
+# 웹사이트(app.py)의 티어 표와 같은 이름. 오타가 나면 웹사이트가 조용히 '골드 1' 로 계산하므로 여기서 걸러냄
+SCRIM_TIERS = {t.replace(" ", ""): t for t in (
+    [f"{n} {i}" for n in ("아이언", "브론즈", "실버", "골드", "플래티넘", "다이아몬드", "초월자", "불멸") for i in (1, 2, 3)]
+    + ["레디언트", "플래 1", "플래 2", "플래 3", "다이아 1", "다이아 2", "다이아 3"])}
+
+
+def scrim_open_db(cur, gid, capacity):
+    cur.execute("SELECT is_open FROM scrim_state WHERE guild_id=%s", (gid,))
+    r = cur.fetchone()
+    if r and r[0]:
+        return False
+    cur.execute(
+        "INSERT INTO scrim_state (guild_id, is_open, capacity) VALUES (%s, TRUE, %s) "
+        "ON CONFLICT (guild_id) DO UPDATE SET is_open = TRUE, capacity = EXCLUDED.capacity",
+        (gid, capacity),
+    )
+    cur.execute("DELETE FROM scrim_entries WHERE guild_id=%s", (gid,))
+    return True
+
+
+def scrim_close_db(cur, gid):
+    """열려 있었으면 닫고 (정원, 신청 인원 수)를, 열려 있지 않았으면 None 을 반환."""
+    cur.execute("UPDATE scrim_state SET is_open = FALSE WHERE guild_id=%s AND is_open RETURNING capacity", (gid,))
+    r = cur.fetchone()
+    if r is None:
+        return None
+    cur.execute("SELECT COUNT(*) FROM scrim_entries WHERE guild_id=%s", (gid,))
+    return r[0], cur.fetchone()[0]
+
+
+def scrim_apply_db(cur, gid, uid, nick, ct, cr, pt, pr):
+    """신청 기간이 아니면 None, 아니면 (새 신청 여부, 내 순번, 정원, 전체 신청 인원). 순번은 최초 신청 순서(수정해도 유지)."""
+    cur.execute("SELECT is_open, capacity FROM scrim_state WHERE guild_id=%s", (gid,))
+    r = cur.fetchone()
+    if not (r and r[0]):
+        return None
+    cur.execute(
+        """
+        INSERT INTO scrim_entries (guild_id, user_id, nickname, cur_tier, cur_rr, peak_tier, peak_rr)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (guild_id, user_id) DO UPDATE SET
+            nickname = EXCLUDED.nickname, cur_tier = EXCLUDED.cur_tier, cur_rr = EXCLUDED.cur_rr,
+            peak_tier = EXCLUDED.peak_tier, peak_rr = EXCLUDED.peak_rr
+        RETURNING (xmax = 0)
+        """,
+        (gid, uid, nick, ct, cr, pt, pr),
+    )
+    is_new = cur.fetchone()[0]
+    cur.execute(
+        "SELECT rn, total FROM (SELECT user_id, ROW_NUMBER() OVER (ORDER BY applied_at, user_id) rn, COUNT(*) OVER () total "
+        "FROM scrim_entries WHERE guild_id=%s) t WHERE user_id=%s",
+        (gid, uid),
+    )
+    rn, total = cur.fetchone()
+    return is_new, rn, r[1], total
+
+
+def scrim_entries_db(cur, gid):
+    cur.execute(
+        "SELECT nickname, cur_tier, cur_rr, peak_tier, peak_rr FROM scrim_entries WHERE guild_id=%s "
+        "ORDER BY applied_at, user_id LIMIT (SELECT COALESCE(MAX(capacity), 10) FROM scrim_state WHERE guild_id=%s)",
+        (gid, gid),
+    )
+    return cur.fetchall()
+
+
+@bot.tree.command(name="내전신청", description="🎮 발로란트 내전에 신청합니다. (다시 입력하면 정보가 수정됩니다)")
+@app_commands.describe(
+    nickname="발로란트 닉네임 (예: 홍길동#KR1)",
+    cur_tier="현재 티어 (예: 다이아몬드 2, 플래 1, 레디언트)", cur_rr="현재 RR (숫자)",
+    peak_tier="최고 티어 (예: 불멸 1)", peak_rr="최고 티어에서의 RR (숫자)",
+)
+@app_commands.rename(nickname="닉네임", cur_tier="현재티어", cur_rr="현재rr", peak_tier="최고티어", peak_rr="최고rr")
+@app_commands.guild_only()
+async def scrim_apply(
+    interaction: discord.Interaction,
+    nickname: app_commands.Range[str, 1, 40],
+    cur_tier: str, cur_rr: app_commands.Range[int, 0, 999],
+    peak_tier: str, peak_rr: app_commands.Range[int, 0, 999],
+):
+    ct, pt = SCRIM_TIERS.get(cur_tier.replace(" ", "")), SCRIM_TIERS.get(peak_tier.replace(" ", ""))
+    if not ct or not pt:
+        await interaction.response.send_message(
+            "❌ 티어를 확인해 주세요. `아이언·브론즈·실버·골드·플래티넘·다이아몬드·초월자·불멸` + 숫자 1~3 "
+            "(예: `다이아몬드 2`, `플래 1`) 또는 `레디언트` 로 입력합니다.", ephemeral=True)
+        return
+    try:
+        res = await run_db(scrim_apply_db, interaction.guild_id, interaction.user.id, nickname.strip(), ct, cur_rr, pt, peak_rr)
+    except Exception as e:
+        print(f"[내전신청 오류] {short_err(e)}")
+        await interaction.response.send_message(f"❌ 신청 중 오류가 발생했습니다: {short_err(e)}", ephemeral=True)
+        return
+    if res is None:
+        await interaction.response.send_message("⛔ 지금은 내전 신청 기간이 아닙니다. 관리자가 `/내전열기` 를 하면 신청할 수 있어요.", ephemeral=True)
+        return
+    is_new, rn, cap, total = res
+    if rn <= cap:
+        head = f"{'✅ **내전 신청!**' if is_new else '✏️ **내전 신청 정보 수정!**'} **{rn}번째** (정원 {cap}명)"
+    else:
+        head = f"{'⏳ **대기 신청!**' if is_new else '✏️ **대기 정보 수정!**'} **대기 {rn - cap}번** (정원 {cap}명 마감)"
+    await interaction.response.send_message(
+        f"{head} {interaction.user.mention}\n"
+        f"🎮 `{nickname.strip()}` · 현재 **{ct} {cur_rr}RR** · 최고 **{pt} {peak_rr}RR**\n"
+        f"👥 신청 **{min(total, cap)}/{cap}명**" + (f" · 대기 **{total - cap}명**" if total > cap else ""),
+        allowed_mentions=NO_MENTIONS,
+    )
+
+
+@bot.tree.command(name="내전열기", description="내전 신청을 시작합니다. 이전 신청 명단은 지워집니다. (관리자 전용)")
+@app_commands.describe(capacity="정원 (선착순, 이후 신청자는 대기) 기본 10")
+@app_commands.rename(capacity="정원")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def scrim_open(interaction: discord.Interaction, capacity: app_commands.Range[int, 2, 100] = 10):
+    await interaction.response.defer()
+    try:
+        opened = await run_db(scrim_open_db, interaction.guild_id, capacity)
+        if not opened:
+            await interaction.followup.send("⚠️ 이미 내전 신청이 열려 있습니다. 마감하려면 `/내전종료` 를 사용하세요.")
+            return
+        await finish_admin_command(
+            interaction, "내전열기",
+            f"🎮 **발로란트 내전 신청을 시작합니다!** (선착순 **{capacity}명**, 이후는 대기)\n`/내전신청 닉네임 현재티어 현재rr 최고티어 최고rr` 로 신청해 주세요.\n"
+            "예) `/내전신청 홍길동#KR1 다이아몬드 2 45 불멸 1 20`",
+            f"내전 신청 열기 (정원 {capacity}명, 이전 명단 삭제)",
+        )
+    except Exception as e:
+        print(f"[내전열기 오류] {short_err(e)}")
+        await interaction.followup.send(f"❌ 오류: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="내전종료", description="내전 신청을 마감합니다. (관리자 전용)")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def scrim_close(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        closed = await run_db(scrim_close_db, interaction.guild_id)
+        if closed is None:
+            await interaction.followup.send("⚠️ 지금 열려 있는 내전 신청이 없습니다.")
+            return
+        cap, total = closed
+        await finish_admin_command(
+            interaction, "내전종료",
+            f"🏁 **내전 신청이 마감되었습니다!** 참가 **{min(total, cap)}명**" + (f" · 대기 **{total - cap}명**" if total > cap else "") + f"\n⚖️ 팀 밸런스 맞추기: {SCRIM_SITE_URL}",
+            f"내전 신청 종료 (신청 {total}명, 정원 {cap}명)",
+        )
+    except Exception as e:
+        print(f"[내전종료 오류] {short_err(e)}")
+        await interaction.followup.send(f"❌ 오류: {e}", ephemeral=True)
+
+
+_SCRIM_RANKS = ("아이언", "브론즈", "실버", "골드", "플래티넘", "다이아몬드", "초월자", "불멸")
+
+
+def scrim_tier_score(tier: str) -> int:
+    """웹사이트(app.py)의 RAW_TIER_SCORES 와 같은 점수: 아이언 1 = 100 … 불멸 3 = 2400, 레디언트 = 2500."""
+    if tier == "레디언트":
+        return 2500
+    name, n = tier.rsplit(" ", 1)
+    name = {"플래": "플래티넘", "다이아": "다이아몬드"}.get(name, name)
+    return 100 * (_SCRIM_RANKS.index(name) * 3 + int(n))
+
+
+def scrim_make_teams(players, num_teams, team_size, cur_weight):
+    """웹사이트(app.py)의 balance_multi_teams 와 같은 방식: 뱀 순서(snake)로 나눈 뒤 팀 평균 편차가 줄도록 1000번 교환."""
+    for p in players:
+        p["mmr"] = (scrim_tier_score(p["ct"]) + p["cr"]) * cur_weight + (scrim_tier_score(p["pt"]) + p["pr"]) * (1 - cur_weight)
+        p["mmr"] += random.uniform(-0.5, 0.5)
+    random.shuffle(players)
+    need = num_teams * team_size
+    chosen, bench = sorted(players[:need], key=lambda p: p["mmr"], reverse=True), players[need:]
+    teams = [[] for _ in range(num_teams)]
+    for i, p in enumerate(chosen):
+        rnd, k = divmod(i, num_teams)
+        teams[k if rnd % 2 == 0 else num_teams - 1 - k].append(p)
+
+    def spread():
+        avgs = [sum(p["mmr"] for p in t) / len(t) for t in teams]
+        m = sum(avgs) / len(avgs)
+        return sum((a - m) ** 2 for a in avgs)
+
+    best = spread()
+    for _ in range(1000):
+        t1, t2 = random.sample(range(num_teams), 2)
+        i1, i2 = random.randrange(team_size), random.randrange(team_size)
+        teams[t1][i1], teams[t2][i2] = teams[t2][i2], teams[t1][i1]
+        new = spread()
+        if new < best:
+            best = new
+        else:
+            teams[t1][i1], teams[t2][i2] = teams[t2][i2], teams[t1][i1]
+    return teams, bench
+
+
+def scrim_players_db(cur, gid):
+    """(정원 안 선착순 명단, 정원 초과 대기 명단)"""
+    cur.execute(
+        "SELECT user_id, nickname, cur_tier, cur_rr, peak_tier, peak_rr FROM scrim_entries WHERE guild_id=%s ORDER BY applied_at, user_id",
+        (gid,),
+    )
+    rows = [dict(uid=u, nick=n, ct=ct, cr=cr, pt=pt, pr=pr) for u, n, ct, cr, pt, pr in cur.fetchall()]
+    cur.execute("SELECT capacity FROM scrim_state WHERE guild_id=%s", (gid,))
+    r = cur.fetchone()
+    cap = r[0] if r else 10
+    return rows[:cap], rows[cap:]
+
+
+@bot.tree.command(name="내전팀뽑기", description="내전 신청자로 밸런스가 맞는 팀을 짭니다. (관리자 전용)")
+@app_commands.describe(
+    teams="팀 개수 (비우면 신청 인원에 맞춰 자동)", team_size="팀당 인원 (기본 5)",
+    cur_weight="현재 티어 반영 비중 % (기본 60, 나머지는 최고 티어)",
+)
+@app_commands.rename(teams="팀수", team_size="팀당인원", cur_weight="현재티어비중")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def scrim_teams(
+    interaction: discord.Interaction,
+    teams: app_commands.Range[int, 2, 8] = None,
+    team_size: app_commands.Range[int, 1, 5] = 5,
+    cur_weight: app_commands.Range[int, 0, 100] = 60,
+):
+    await interaction.response.defer()
+    try:
+        players, waitlist = await run_db(scrim_players_db, interaction.guild_id)
+        num = teams or max(2, min(8, len(players) // team_size))
+        if len(players) < num * team_size:
+            await interaction.followup.send(f"⚠️ {num}팀 × {team_size}명 = **{num * team_size}명**이 필요합니다. (정원 내 신청 {len(players)}명)")
+            return
+        result, bench = scrim_make_teams(players, num, team_size, cur_weight / 100)
+        embed = discord.Embed(title=f"⚔️ 내전 팀 구성 ({num}팀 × {team_size}명)", color=discord.Color.red())
+        for i, t in enumerate(result):
+            avg = sum(p["mmr"] for p in t) / len(t)
+            embed.add_field(
+                name=f"TEAM {chr(65 + i)} · 평균 {avg:.1f}",
+                value="\n".join(f"{p['nick']} · {p['ct']} {p['cr']}RR <@{p['uid']}>" for p in t),
+                inline=True,
+            )
+        if bench:
+            embed.add_field(name="⏳ 대기", value=", ".join(f"{p['nick']} <@{p['uid']}>" for p in bench)[:1000], inline=False)
+        if waitlist:
+            embed.add_field(name="🕒 정원 초과 대기 (선착순)", value=", ".join(f"{p['nick']} <@{p['uid']}>" for p in waitlist)[:1000], inline=False)
+        embed.set_footer(text=f"참가 {len(players)}명 · 현재 티어 {cur_weight}% / 최고 티어 {100 - cur_weight}% 반영")
+        await interaction.followup.send(embed=embed, allowed_mentions=NO_MENTIONS)
+        await finish_admin_command(interaction, "내전팀뽑기", "⚔️ 내전 팀을 짰습니다. 다시 뽑으려면 `/내전팀뽑기` 를 다시 사용하세요.",
+                                   f"내전 팀 뽑기 ({num}팀 × {team_size}명, 신청 {len(players)}명)")
+    except Exception as e:
+        print(f"[내전팀뽑기 오류] {short_err(e)}")
+        await interaction.followup.send(f"❌ 오류: {e}", ephemeral=True)
 
 
 @bot.tree.command(name="공지", description="입력한 내용을 봇이 이 채팅방에 대신 작성합니다. (관리자 전용)")
@@ -2761,7 +3105,7 @@ async def show_commands(interaction: discord.Interaction):
     embed = discord.Embed(title="🤖 봇 명령어 안내", color=discord.Color.blue())
     embed.add_field(
         name="👤 일반 명령어",
-        value="• `/정보 [유저]`\n• `/추천인 [유저]`\n• `/슬롯머신 [배팅액]`\n• `/바카라 [베팅]`\n• `/코인순위`\n• `/이용순위`\n• `/명령어`",
+        value="• `/정보 [유저]`\n• `/추천인 [유저]`\n• `/내전신청 [닉네임] [현재티어] [현재rr] [최고티어] [최고rr]`\n• `/슬롯머신 [배팅액]`\n• `/바카라 [베팅]`\n• `/코인순위`\n• `/이용순위`\n• `/명령어`",
         inline=False,
     )
 
@@ -2770,7 +3114,7 @@ async def show_commands(interaction: discord.Interaction):
     if perms is not None and perms.administrator:
         embed.add_field(
             name="🛡 관리자 전용",
-            value="• `/채팅청소 [수량] [유저]` (수량 입력 후 유저는 선택사항)\n• `/경고지급 [유저] [횟수] [사유]` (횟수에 음수 입력 시 경고 차감)\n• `/코인지급`\n• `/코인회수`\n• `/방어권지급`\n• `/닉네임동기화`\n• `/로그` (명령어를 입력한 채널을 관리자 명령어 사용 기록 채널로 지정)\n• `/음챗로그` (명령어를 입력한 채널을 음성 채널 입장/퇴장 기록 채널로 지정)\n• `/채팅로그` (명령어를 입력한 채널을 채팅 삭제/수정 기록 채널로 지정)",
+            value="• `/채팅청소 [수량] [유저]` (수량 입력 후 유저는 선택사항)\n• `/경고지급 [유저] [횟수] [사유]` (횟수에 음수 입력 시 경고 차감)\n• `/코인지급`\n• `/코인회수`\n• `/방어권지급`\n• `/닉네임동기화`\n• `/로그` (명령어를 입력한 채널을 관리자 명령어 사용 기록 채널로 지정)\n• `/음챗로그` (명령어를 입력한 채널을 음성 채널 입장/퇴장 기록 채널로 지정)\n• `/채팅로그` (명령어를 입력한 채널을 채팅 삭제/수정 기록 채널로 지정)\n• `/내전열기 [정원]` / `/내전종료`\n• `/내전팀뽑기 [팀수] [팀당인원] [현재티어비중]`",
             inline=False,
         )
     await interaction.response.send_message(embed=embed, ephemeral=True)

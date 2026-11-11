@@ -1643,8 +1643,13 @@ async def finish_admin_command(interaction: discord.Interaction, command_name: s
 SCRIM_SITE_URL = "https://dgv-balancer-jspmebzvfw6gx6wfpyxxxw.streamlit.app/"
 # 웹사이트(app.py)의 티어 표와 같은 이름. 오타가 나면 웹사이트가 조용히 '골드 1' 로 계산하므로 여기서 걸러냄
 SCRIM_TIERS = {t.replace(" ", ""): t for t in (
-    [f"{n} {i}" for n in ("아이언", "브론즈", "실버", "골드", "플래티넘", "다이아몬드", "초월자", "불멸") for i in (1, 2, 3)]
-    + ["레디언트", "플래 1", "플래 2", "플래 3", "다이아 1", "다이아 2", "다이아 3"])}
+    [f"{n} {i}" for n in ("아이언", "브론즈", "실버", "골드", "플레티넘", "다이아몬드", "초월자", "불멸") for i in (1, 2, 3)]
+    + ["레디언트"])}
+# 줄임말·예전 철자로 입력해도 받아 주고, 저장은 항상 정식 이름
+SCRIM_TIERS.update({f"{a}{i}": f"{full} {i}" for a, full in (("플레", "플레티넘"), ("플래", "플레티넘"), ("플래티넘", "플레티넘"), ("다이아", "다이아몬드"),
+                                         ("아", "아이언"), ("브", "브론즈"), ("실", "실버"), ("골", "골드"), ("플", "플레티넘"),
+                                         ("다", "다이아몬드"), ("초", "초월자"), ("불", "불멸")) for i in (1, 2, 3)})
+SCRIM_TIERS["레"] = "레디언트"
 
 
 def scrim_open_db(cur, gid, capacity):
@@ -1710,7 +1715,7 @@ def scrim_entries_db(cur, gid):
 @bot.tree.command(name="내전신청", description="🎮 발로란트 내전에 신청합니다. (다시 입력하면 정보가 수정됩니다)")
 @app_commands.describe(
     nickname="발로란트 닉네임 (예: 홍길동#KR1)",
-    cur_tier="현재 티어 (예: 다이아몬드 2, 플래 1, 레디언트)", cur_rr="현재 RR (숫자)",
+    cur_tier="현재 티어 (예: 다이아몬드 2, 플레티넘 1, 레디언트 / 앞글자만 써도 됨: 다 2, 플 1, 레)", cur_rr="현재 RR (숫자)",
     peak_tier="최고 티어 (예: 불멸 1)", peak_rr="최고 티어에서의 RR (숫자)",
 )
 @app_commands.rename(nickname="닉네임", cur_tier="현재티어", cur_rr="현재rr", peak_tier="최고티어", peak_rr="최고rr")
@@ -1724,8 +1729,8 @@ async def scrim_apply(
     ct, pt = SCRIM_TIERS.get(cur_tier.replace(" ", "")), SCRIM_TIERS.get(peak_tier.replace(" ", ""))
     if not ct or not pt:
         await interaction.response.send_message(
-            "❌ 티어를 확인해 주세요. `아이언·브론즈·실버·골드·플래티넘·다이아몬드·초월자·불멸` + 숫자 1~3 "
-            "(예: `다이아몬드 2`, `플래 1`) 또는 `레디언트` 로 입력합니다.", ephemeral=True)
+            "❌ 티어를 확인해 주세요. `아이언·브론즈·실버·골드·플레티넘·다이아몬드·초월자·불멸` + 숫자 1~3 "
+            "(예: `다이아몬드 2`, `플레티넘 1`) 또는 `레디언트` 로 입력합니다. 앞글자만 써도 됩니다 (`다 2`, `플 1`, `레`).", ephemeral=True)
         return
     try:
         res = await run_db(scrim_apply_db, interaction.guild_id, interaction.user.id, nickname.strip(), ct, cur_rr, pt, peak_rr)
@@ -1773,6 +1778,128 @@ async def scrim_open(interaction: discord.Interaction, capacity: app_commands.Ra
         await interaction.followup.send(f"❌ 오류: {e}", ephemeral=True)
 
 
+def scrim_remove_db(cur, gid, uid, require_open):
+    """신청 취소/제거. 'closed'(신청 기간 아님) / None(신청 안 한 사람) / (정원, 정원 안에 새로 올라온 사람 dict 또는 None)."""
+    cur.execute("SELECT is_open, capacity FROM scrim_state WHERE guild_id=%s", (gid,))
+    st = cur.fetchone()
+    if require_open and not (st and st[0]):
+        return "closed"
+    cap = st[1] if st else 10
+    cur.execute(
+        "SELECT rn, total FROM (SELECT user_id, ROW_NUMBER() OVER (ORDER BY applied_at, user_id) rn, COUNT(*) OVER () total "
+        "FROM scrim_entries WHERE guild_id=%s) t WHERE user_id=%s",
+        (gid, uid),
+    )
+    r = cur.fetchone()
+    if r is None:
+        return None
+    rn, total = r
+    cur.execute("DELETE FROM scrim_entries WHERE guild_id=%s AND user_id=%s", (gid, uid))
+    promoted = None
+    if rn <= cap < total:  # 정원 안 사람이 빠졌고 대기자가 있으면 대기 1번이 정원 마지막 자리로 올라옴
+        cur.execute(
+            "SELECT user_id, nickname FROM scrim_entries WHERE guild_id=%s ORDER BY applied_at, user_id OFFSET %s LIMIT 1",
+            (gid, cap - 1),
+        )
+        p = cur.fetchone()
+        promoted = dict(uid=p[0], nick=p[1])
+    return cap, promoted
+
+
+def scrim_list_db(cur, gid):
+    """(신청 열림 여부, 정원, [(user_id, 닉네임, 현재티어, 현재RR, 최고티어, 최고RR) …선착순])"""
+    cur.execute("SELECT is_open, capacity FROM scrim_state WHERE guild_id=%s", (gid,))
+    st = cur.fetchone() or (False, 10)
+    cur.execute(
+        "SELECT user_id, nickname, cur_tier, cur_rr, peak_tier, peak_rr FROM scrim_entries WHERE guild_id=%s ORDER BY applied_at, user_id",
+        (gid,),
+    )
+    return st[0], st[1], cur.fetchall()
+
+
+def _promo_text(promoted):
+    return f"\n🔔 대기 1번 <@{promoted['uid']}> 님이 정원 안으로 올라왔습니다! (`{promoted['nick']}`)" if promoted else ""
+
+
+_PROMO_MENTION = lambda promoted: discord.AllowedMentions(users=[discord.Object(id=promoted["uid"])]) if promoted else NO_MENTIONS
+
+
+@bot.tree.command(name="내전취소", description="내전 신청을 취소합니다.")
+@app_commands.guild_only()
+async def scrim_cancel(interaction: discord.Interaction):
+    try:
+        res = await run_db(scrim_remove_db, interaction.guild_id, interaction.user.id, True)
+    except Exception as e:
+        print(f"[내전취소 오류] {short_err(e)}")
+        await interaction.response.send_message(f"❌ 오류: {short_err(e)}", ephemeral=True)
+        return
+    if res == "closed":
+        await interaction.response.send_message("⛔ 지금은 신청 기간이 아니라 취소할 수 없습니다. 관리자에게 문의하세요.", ephemeral=True)
+    elif res is None:
+        await interaction.response.send_message("⚠️ 내전에 신청한 기록이 없습니다.", ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            f"🗑️ {interaction.user.mention} 님이 내전 신청을 취소했습니다." + _promo_text(res[1]),
+            allowed_mentions=discord.AllowedMentions(users=[interaction.user] + ([discord.Object(id=res[1]["uid"])] if res[1] else [])),
+        )
+
+
+@bot.tree.command(name="내전제거", description="내전 신청자를 명단에서 제거합니다. (관리자 전용)")
+@app_commands.describe(user="제거할 유저")
+@app_commands.rename(user="유저")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def scrim_remove(interaction: discord.Interaction, user: discord.User):
+    await interaction.response.defer()
+    try:
+        res = await run_db(scrim_remove_db, interaction.guild_id, user.id, False)
+        if res is None:
+            await interaction.followup.send(f"⚠️ {user.mention} 님은 내전 신청 명단에 없습니다.", allowed_mentions=NO_MENTIONS)
+            return
+        await finish_admin_command(interaction, "내전제거", f"🗑️ {user.mention} 님을 내전 명단에서 제거했습니다.", f"내전 신청 제거: {user} ({user.id})")
+        if res[1]:
+            await interaction.followup.send(_promo_text(res[1]).strip(), allowed_mentions=_PROMO_MENTION(res[1]))
+    except Exception as e:
+        print(f"[내전제거 오류] {short_err(e)}")
+        await interaction.followup.send(f"❌ 오류: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="내전명단", description="현재 내전 신청자와 대기자를 봅니다.")
+@app_commands.guild_only()
+async def scrim_roster(interaction: discord.Interaction):
+    try:
+        is_open, cap, rows = await run_db(scrim_list_db, interaction.guild_id)
+    except Exception as e:
+        print(f"[내전명단 오류] {short_err(e)}")
+        await interaction.response.send_message(f"❌ 오류: {short_err(e)}", ephemeral=True)
+        return
+    if not rows:
+        await interaction.response.send_message("📋 신청자가 없습니다." + ("" if is_open else " (신청 기간이 아닙니다)"), ephemeral=True)
+        return
+    fmt = lambda i, r: f"{i}. {r[1]} · {r[2]} {r[3]}RR / 최고 {r[4]} {r[5]}RR <@{r[0]}>"
+    embed = discord.Embed(title=f"📋 내전 명단 ({'신청 중' if is_open else '마감'})", color=discord.Color.blue())
+    # 필드 값은 1024자 제한이라 줄 단위로 잘라 담음
+    budget = [5400]  # 임베드 전체 6000자 제한
+
+    def add(name, lines):
+        chunk = ""
+        for n, ln in enumerate(lines):
+            budget[0] -= len(ln) + 1
+            if budget[0] < 0:
+                chunk += f"…외 {len(lines) - n}명\n"
+                break
+            if len(chunk) + len(ln) + 1 > 1000:
+                embed.add_field(name=name, value=chunk, inline=False); chunk, name = "", "\u200b"
+            chunk += ln + "\n"
+        if chunk:
+            embed.add_field(name=name, value=chunk, inline=False)
+    add(f"✅ 참가 {min(len(rows), cap)}/{cap}명", [fmt(i, r) for i, r in enumerate(rows[:cap], 1)])
+    if len(rows) > cap:
+        add(f"🕒 대기 {len(rows) - cap}명", [fmt(i, r) for i, r in enumerate(rows[cap:], 1)])
+    await interaction.response.send_message(embed=embed, allowed_mentions=NO_MENTIONS)
+
+
 @bot.tree.command(name="내전종료", description="내전 신청을 마감합니다. (관리자 전용)")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
@@ -1795,7 +1922,7 @@ async def scrim_close(interaction: discord.Interaction):
         await interaction.followup.send(f"❌ 오류: {e}", ephemeral=True)
 
 
-_SCRIM_RANKS = ("아이언", "브론즈", "실버", "골드", "플래티넘", "다이아몬드", "초월자", "불멸")
+_SCRIM_RANKS = ("아이언", "브론즈", "실버", "골드", "플레티넘", "다이아몬드", "초월자", "불멸")
 
 
 def scrim_tier_score(tier: str) -> int:
@@ -1803,7 +1930,7 @@ def scrim_tier_score(tier: str) -> int:
     if tier == "레디언트":
         return 2500
     name, n = tier.rsplit(" ", 1)
-    name = {"플래": "플래티넘", "다이아": "다이아몬드"}.get(name, name)
+    name = {"플래": "플레티넘", "플래티넘": "플레티넘", "다이아": "다이아몬드"}.get(name, name)
     return 100 * (_SCRIM_RANKS.index(name) * 3 + int(n))
 
 
@@ -3105,7 +3232,7 @@ async def show_commands(interaction: discord.Interaction):
     embed = discord.Embed(title="🤖 봇 명령어 안내", color=discord.Color.blue())
     embed.add_field(
         name="👤 일반 명령어",
-        value="• `/정보 [유저]`\n• `/추천인 [유저]`\n• `/내전신청 [닉네임] [현재티어] [현재rr] [최고티어] [최고rr]`\n• `/슬롯머신 [배팅액]`\n• `/바카라 [베팅]`\n• `/코인순위`\n• `/이용순위`\n• `/명령어`",
+        value="• `/정보 [유저]`\n• `/추천인 [유저]`\n• `/내전신청 [닉네임] [현재티어] [현재rr] [최고티어] [최고rr]`\n• `/내전취소` / `/내전명단`\n• `/슬롯머신 [배팅액]`\n• `/바카라 [베팅]`\n• `/코인순위`\n• `/이용순위`\n• `/명령어`",
         inline=False,
     )
 
@@ -3114,7 +3241,7 @@ async def show_commands(interaction: discord.Interaction):
     if perms is not None and perms.administrator:
         embed.add_field(
             name="🛡 관리자 전용",
-            value="• `/채팅청소 [수량] [유저]` (수량 입력 후 유저는 선택사항)\n• `/경고지급 [유저] [횟수] [사유]` (횟수에 음수 입력 시 경고 차감)\n• `/코인지급`\n• `/코인회수`\n• `/방어권지급`\n• `/닉네임동기화`\n• `/로그` (명령어를 입력한 채널을 관리자 명령어 사용 기록 채널로 지정)\n• `/음챗로그` (명령어를 입력한 채널을 음성 채널 입장/퇴장 기록 채널로 지정)\n• `/채팅로그` (명령어를 입력한 채널을 채팅 삭제/수정 기록 채널로 지정)\n• `/내전열기 [정원]` / `/내전종료`\n• `/내전팀뽑기 [팀수] [팀당인원] [현재티어비중]`",
+            value="• `/채팅청소 [수량] [유저]` (수량 입력 후 유저는 선택사항)\n• `/경고지급 [유저] [횟수] [사유]` (횟수에 음수 입력 시 경고 차감)\n• `/코인지급`\n• `/코인회수`\n• `/방어권지급`\n• `/닉네임동기화`\n• `/로그` (명령어를 입력한 채널을 관리자 명령어 사용 기록 채널로 지정)\n• `/음챗로그` (명령어를 입력한 채널을 음성 채널 입장/퇴장 기록 채널로 지정)\n• `/채팅로그` (명령어를 입력한 채널을 채팅 삭제/수정 기록 채널로 지정)\n• `/내전열기 [정원]` / `/내전종료` / `/내전제거 [유저]`\n• `/내전팀뽑기 [팀수] [팀당인원] [현재티어비중]`",
             inline=False,
         )
     await interaction.response.send_message(embed=embed, ephemeral=True)
